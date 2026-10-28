@@ -71,6 +71,10 @@ hdc shell aa start -a QAbility -b com.opensph.app
 - 预览/子窗口/导出渲染一致
 - wx 回退路径（QAbility）可正常启动
 
+## 测试报告
+
+全功能遍历测试（菜单、右键菜单、导出选项、属性面板 6 类控件、会话往返、模拟、画布、渲染）的完整结果见 [docs/TEST-REPORT.md](docs/TEST-REPORT.md)：350 次交互、零闪退、8 个已修缺陷（含 3 个高危）。
+
 ## 许可
 
 界面与桥接代码：随上游保持一致。OpenSPH 内核版权归其原作者（Pavel Ševeček）。

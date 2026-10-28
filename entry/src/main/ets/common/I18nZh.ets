@@ -322,6 +322,16 @@ export const SETTING_LABELS_EXTRA: Map<string, string> = new Map<string, string>
 ]);
 
 export const ENUM_LABELS_EXTRA: Map<string, string> = new Map<string, string>([
+  // 枚举选项值补遗（此前会直接显示英文）
+  ['relaxing', '松弛'],
+  ['stratified', '分层'],
+  ['murnaghan', 'Murnaghan 状态方程'],
+  ['polytropic', '多方状态方程'],
+  ['simplified tillotson', '简化 Tillotson'],
+  ['tait', 'Tait 状态方程'],
+  ['tensor grady kipp', '张量 Grady-Kipp'],
+  ['dust', '尘埃'],
+  ['ellipsoidal', '椭球形'],
   ['hexagonal', '六角密排'],
   ['hexagonal close packed', '六角密排'],
   ['tillotson', 'Tillotson'],

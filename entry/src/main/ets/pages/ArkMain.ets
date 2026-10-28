@@ -310,6 +310,8 @@ struct ArkMain {
   @State private linkFrom: number = -1;
   @State private settings: SettingCategory[] = [];
   @State private pendingValue: string = '';
+  private pendingByKey: Map<string, string> = new Map<string, string>();
+  private pendingTimers: Map<string, number> = new Map<string, number>();
   @State private toasts: AppNotice[] = [];
   @State private history: AppNotice[] = [];
   @State private unread: number = 0;
@@ -1570,6 +1572,7 @@ struct ArkMain {
   }
 
   private startLink(id: number): void {
+    hilog.info(0x0000, 'OpenSPHLink', `start id=${id}`);
     const n: GraphNode | undefined = this.nodeById(id);
     if (!n) {
       return;
@@ -1592,6 +1595,7 @@ struct ArkMain {
   }
 
   private finishLink(id: number): void {
+    hilog.info(0x0000, 'OpenSPHLink', `end id=${id} linkX=${this.linkX.toFixed(1)} linkY=${this.linkY.toFixed(1)} from=${this.linkFrom}`);
     if (this.linkFrom < 0) {
       return;
     }
@@ -1610,6 +1614,7 @@ struct ArkMain {
         target = n.id;
       }
     }
+    hilog.info(0x0000, 'OpenSPHLink', `target=${target} best=${best.toFixed(1)} nodes=${this.nodes.length}`);
     if (target < 0) {
       // 没落到端口：立即清掉临时连线，不留残影
       this.linkFrom = -1;
@@ -1685,13 +1690,22 @@ struct ArkMain {
       ?? ENUM_LABELS_EXTRA.get(raw) ?? ENUM_LABELS_EXTRA.get(capitalized) ?? raw;
   }
 
-  private applySetting(entry: SettingEntry, raw: string): void {
+  private applySetting(entry: SettingEntry, rawIn: string): void {
+    let raw: string = rawIn;
+    if (entry.type === 'int' || entry.type === 'float') {
+      raw = this.sanitizeNumeric(entry, rawIn);
+      if (raw.length === 0) {
+        return;
+      }
+    }
     const node: GraphNode | undefined = this.nodeById(this.settingsNode);
     if (!node || node.handle < 0) {
       return;
     }
     try {
       ark.setNodeSetting(node.handle, entry.key, raw, entry.type);
+      hilog.info(0x0000, 'OpenSPHSet',
+        `set key=${entry.key} type=${entry.type} value=${raw} handle=${node.handle}`);
       this.noticeService.success('已更新参数', `${this.settingLabel(entry.name)} = ${raw}`);
     } catch (e) {
       this.noticeService.error('参数写入失败', String(e));
@@ -1705,6 +1719,20 @@ struct ArkMain {
     this.loadSettings(id);
   }
 
+  // 内核生成的默认实例名（unnamed sphere 等）在界面上翻译成中文。
+  // 只做显示层替换；写回内核时仍用原文，避免改动上游语义。
+  private displayNameValue(raw: string): string {
+    const mapped: string | undefined = SETTING_LABELS.get(raw) ?? SETTING_LABELS_EXTRA.get(raw);
+    if (mapped !== undefined) {
+      return mapped;
+    }
+    const prefix: string = 'unnamed ';
+    if (raw.startsWith(prefix)) {
+      return `未命名${raw.substring(prefix.length)}`;
+    }
+    return raw;
+  }
+
   private valueText(entry: SettingEntry): string {
     if (typeof entry.value === 'number') {
       const n: number = entry.value as number;
@@ -1716,6 +1744,9 @@ struct ArkMain {
         return String(Math.round(n * 1000) / 1000);
       }
       return String(n);
+    }
+    if (entry.key === 'name' && typeof entry.value === 'string') {
+      return this.displayNameValue(entry.value as string);
     }
     if (typeof entry.value === 'boolean') {
       return (entry.value as boolean) ? '是' : '否';
@@ -3038,6 +3069,54 @@ struct ArkMain {
     this.applySettingRaw(entry, `${Number.isFinite(loV) ? loV : 0},${Number.isFinite(hiV) ? hiV : 0}`);
   }
 
+  // 数值清洗：拦截非法/超范围输入，避免把 1e8 个粒子之类写进内核
+  private sanitizeNumeric(entry: SettingEntry, raw: string): string {
+    const v: number = Number(raw);
+    if (!Number.isFinite(v)) {
+      this.noticeService.warn('输入无效', '请输入数字');
+      return '';
+    }
+    if (entry.type === 'int') {
+      let iv: number = Math.round(v);
+      const k: string = entry.key.toLowerCase();
+      if (k.includes('count') || k.includes('particles')) {
+        iv = Math.min(2000000, Math.max(1, iv));   // 粒子类：1 ~ 200 万
+      } else if (k.includes('step') || k.includes('iteration')) {
+        iv = Math.min(1000000, Math.max(0, iv));
+      } else {
+        iv = Math.min(1000000000, Math.max(-1000000000, iv));
+      }
+      return String(iv);
+    }
+    // float：限制到有限且量级合理，保留最多 6 位小数
+    const clamped: number = Math.min(1e12, Math.max(-1e12, v));
+    return String(Math.round(clamped * 1e6) / 1e6);
+  }
+
+  private pendingOf(key: string): string {
+    const v: string | undefined = this.pendingByKey.get(key);
+    return v === undefined ? '' : v;
+  }
+
+  private setPending(key: string, value: string): void {
+    this.pendingByKey.set(key, value);
+  }
+
+  // 输入防抖提交：上次输入后 700ms 无新输入才写入内核。
+  // 之所以不依赖 onEditChange/onSubmit：在触摸输入下这两个回调在多项输入行里不触发，
+  // 导致向量/区间改了界面却没写进内核（实测确认）。
+  private scheduleCommit(key: string, commit: () => void): void {
+    const prev: number | undefined = this.pendingTimers.get(key);
+    if (prev !== undefined) {
+      clearTimeout(prev);
+    }
+    const timer: number = setTimeout(() => {
+      this.pendingTimers.delete(key);
+      commit();
+    }, 700);
+    this.pendingTimers.set(key, timer);
+  }
+
   private applySettingRaw(entry: SettingEntry, raw: string): void {
     const node: GraphNode | undefined = this.nodeById(this.settingsNode);
     if (!node || node.handle < 0) {
@@ -3045,6 +3124,8 @@ struct ArkMain {
     }
     try {
       ark.setNodeSetting(node.handle, entry.key, raw, entry.type);
+      hilog.info(0x0000, 'OpenSPHSet',
+        `set key=${entry.key} type=${entry.type} value=${raw} handle=${node.handle}`);
       this.noticeService.success('已更新参数', `${this.settingLabel(entry.name)} = ${raw}`);
       this.loadSettingsForce(node.id);
     } catch (e) {
@@ -3065,7 +3146,7 @@ struct ArkMain {
           Row({ space: 4 }) {
             ForEach([0, 1, 2], (i: number) => {
               TextInput({ text: this.numAt(entry, i) })
-                .type(InputType.Number)
+                .type(InputType.NUMBER_DECIMAL)
                 .fontSize(11)
                 .width(58)
                 .height(26)
@@ -3075,14 +3156,29 @@ struct ArkMain {
                 .border({ width: 1, color: '#e4e7eb' })
                 .onEditChange((isEditing: boolean) => {
                   if (!isEditing) {
-                    this.applyVectorPart(entry, i, this.pendingValue);
+                    const txt: string = this.pendingOf(entry.key + '#' + i);
+                    if (txt.length > 0) {
+                      this.applyVectorPart(entry, i, txt);
+                      this.setPending(entry.key + '#' + i, '');
+                    }
                   }
                 })
                 .onChange((value: string) => {
-                  this.pendingValue = value;
+                  const k: string = entry.key + '#' + i;
+                  this.setPending(k, value);
+                  this.scheduleCommit(k, () => {
+                    const txt: string = this.pendingOf(k);
+                    if (txt.length > 0) {
+                      this.applyVectorPart(entry, i, txt);
+                    }
+                  });
                 })
                 .onSubmit(() => {
-                  this.applyVectorPart(entry, i, this.pendingValue);
+                  const txt: string = this.pendingOf(entry.key + '#' + i);
+                  if (txt.length > 0) {
+                    this.applyVectorPart(entry, i, txt);
+                    this.setPending(entry.key + '#' + i, '');
+                  }
                 })
             }, (i: number) => entry.key + '#' + i)
           }
@@ -3090,7 +3186,7 @@ struct ArkMain {
           Row({ space: 4 }) {
             ForEach([0, 1], (i: number) => {
               TextInput({ text: this.numAt(entry, i) })
-                .type(InputType.Number)
+                .type(InputType.NUMBER_DECIMAL)
                 .fontSize(11)
                 .width(64)
                 .height(26)
@@ -3100,14 +3196,29 @@ struct ArkMain {
                 .border({ width: 1, color: '#e4e7eb' })
                 .onEditChange((isEditing: boolean) => {
                   if (!isEditing) {
-                    this.applyIntervalPart(entry, i === 0, this.pendingValue);
+                    const txt: string = this.pendingOf(entry.key + 'i' + i);
+                    if (txt.length > 0) {
+                      this.applyIntervalPart(entry, i === 0, txt);
+                      this.setPending(entry.key + 'i' + i, '');
+                    }
                   }
                 })
                 .onChange((value: string) => {
-                  this.pendingValue = value;
+                  const k: string = entry.key + 'i' + i;
+                  this.setPending(k, value);
+                  this.scheduleCommit(k, () => {
+                    const txt: string = this.pendingOf(k);
+                    if (txt.length > 0) {
+                      this.applyIntervalPart(entry, i === 0, txt);
+                    }
+                  });
                 })
                 .onSubmit(() => {
-                  this.applyIntervalPart(entry, i === 0, this.pendingValue);
+                  const txt: string = this.pendingOf(entry.key + 'i' + i);
+                  if (txt.length > 0) {
+                    this.applyIntervalPart(entry, i === 0, txt);
+                    this.setPending(entry.key + 'i' + i, '');
+                  }
                 })
             }, (i: number) => entry.key + 'i' + i)
           }
@@ -3132,7 +3243,7 @@ struct ArkMain {
             })
         } else if (entry.type === 'int' || entry.type === 'float') {
           TextInput({ text: this.valueText(entry) })
-            .type(InputType.Number)
+            .type(entry.type === 'float' ? InputType.NUMBER_DECIMAL : InputType.Number)
             .fontSize(12)
             .width(96)
             .height(28)
@@ -3468,24 +3579,6 @@ struct ArkMain {
       .padding({ bottom: 10 })
 
       Row() {
-        Text('预设').fontSize(12).fontColor('#5f6670').width(70);
-        ForEach([0, 1, 2], (pid: number) => {
-          Text(pid === 0 ? '快速预览片' : (pid === 1 ? '标准成片' : '高质量 4K'))
-            .fontSize(12)
-            .fontColor(this.exportPreset === pid ? '#0b57d0' : '#3c4149')
-            .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-            .margin({ right: 6 })
-            .borderRadius(6)
-            .backgroundColor(this.exportPreset === pid ? '#e8f0fe' : '#f2f4f7')
-            .onClick(() => {
-              this.applyExportPreset(pid);
-            });
-        }, (pid: number) => `${pid}`)
-      }
-      .width('100%')
-      .padding({ top: 4, bottom: 6 })
-
-      Row() {
         Text('模式').fontSize(12).fontColor('#5f6670').width(70);
         ForEach(['离线渲染', '录制预览'], (label: string, index: number) => {
           Text(label)
@@ -3504,6 +3597,24 @@ struct ArkMain {
       }
       .width('100%')
       .padding({ top: 4, bottom: 4 })
+
+      Row() {
+        Text('预设').fontSize(12).fontColor('#5f6670').width(70);
+        ForEach([0, 1, 2], (pid: number) => {
+          Text(pid === 0 ? '快速预览片' : (pid === 1 ? '标准成片' : '高质量 4K'))
+            .fontSize(12)
+            .fontColor(this.exportPreset === pid ? '#0b57d0' : '#3c4149')
+            .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+            .margin({ right: 6 })
+            .borderRadius(6)
+            .backgroundColor(this.exportPreset === pid ? '#e8f0fe' : '#f2f4f7')
+            .onClick(() => {
+              this.applyExportPreset(pid);
+            });
+        }, (pid: number) => `${pid}`)
+      }
+      .width('100%')
+      .padding({ top: 4, bottom: 6 })
 
       if (this.exportMode === 0) {
       Row() {
@@ -3641,7 +3752,8 @@ struct ArkMain {
       .padding({ top: 4, bottom: 4 })
 
       Row() {
-        Text(`${this.exportSize()[0]} × ${this.exportSize()[1]} · ${this.exportFps} fps · ${this.exportFrames} 帧`)
+        Text(`${this.exportSize()[0]} × ${this.exportSize()[1]} · ${this.exportFps} fps · ${this.exportFrames} 帧`
+          + (this.exportMode === 0 ? ` · 画质：${this.exportQuality === 1 ? '快速' : (this.exportQuality === 2 ? '标准' : '高（2× 采样）')}` : ' · 录制模式'))
           .fontSize(11)
           .fontColor('#8b929b');
       }
