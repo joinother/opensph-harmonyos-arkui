@@ -949,7 +949,17 @@ struct ArkMain {
     const w: number = Math.floor(this.previewCtx.width / 2) * 2;
     const h: number = Math.floor(this.previewCtx.height / 2) * 2;
     if (w <= 0 || h <= 0) {
-      this.noticeService.warn('无法录制', '先打开「预览」页签');
+      // 预览画布还没布局（当前在节点图页签）：自动切到预览页签，布局完成后再真正开始录制。
+      // 之前这里只弹一个瞬时提示就返回，用户会觉得按钮坏了。
+      if (this.canvasTab !== 1) {
+        this.noticeService.info('正在切换到预览', '录制需要预览画布尺寸');
+        this.canvasTab = 1;
+        setTimeout(() => {
+          this.startRecordingPreview();
+        }, 400);
+        return;
+      }
+      this.noticeService.warn('无法录制', '预览画布尺寸为 0，请稍后重试');
       return;
     }
     const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
