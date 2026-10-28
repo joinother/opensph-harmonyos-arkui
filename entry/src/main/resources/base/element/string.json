@@ -1,0 +1,7 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "OpenSPH SPH/N-body simulation for HarmonyOS" },
+    { "name": "EntryAbility_desc", "value": "OpenSPH main entry" },
+    { "name": "EntryAbility_label", "value": "OpenSPH" }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "./.certs/opensph-debug/cert_fbed69eddd22fe8fc46eb43fb162f4a0.cer",
+          "keyAlias": "opensph",
+          "keyPassword": "000000217EE9E14AB50CC6DDD6DBE510F179B97AC601C5598A57C0AE09CBA01C7FF7AB6F6BE5D7B6F067A4766E11755863",
+          "profile": "./.certs/opensph-debug/profile_fbed69eddd22fe8fc46eb43fb162f4a0.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "./.certs/opensph-debug/key_fbed69eddd22fe8fc46eb43fb162f4a0.p12",
+          "storePassword": "00000021FBDAF98C34BFCADC58210E27E94317248B7562E137DE7A85885F8A5E435BDEC4E125E69C91E2694DDE75FE46B2"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "6.1.1(24)",
+        "runtimeOS": "HarmonyOS"
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

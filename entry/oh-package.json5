@@ -1,0 +1,12 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "OpenSPH entry module",
+  "main": "",
+  "author": "",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/libqohos.so": "file:./src/main/qt"
+  },
+  "dependencies": {}
+}

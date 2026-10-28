@@ -1,0 +1,50 @@
+{
+  "module": {
+    "name": "entry",
+    "type": "entry",
+    "srcEntry": "./ets/qabilitystage/QAbilityStage.ets",
+    "description": "$string:module_desc",
+    "mainElement": "ArkAbility",
+    "deviceTypes": ["tablet", "2in1"],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "abilities": [
+      {
+        "name": "ArkAbility",
+        "srcEntry": "./ets/arkability/ArkAbility.ets",
+        "launchType": "singleton",
+        "description": "$string:EntryAbility_desc",
+        "icon": "$media:app_icon",
+        "label": "$string:EntryAbility_label",
+        "startWindowIcon": "$media:app_icon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "skills": [
+          {
+            "entities": ["entity.system.home"],
+            "actions": ["action.system.home"]
+          }
+        ]
+      },
+      {
+        "name": "QAbility",
+        "srcEntry": "./ets/qability/QAbility.ets",
+        "launchType": "specified",
+        "description": "$string:EntryAbility_desc",
+        "icon": "$media:app_icon",
+        "label": "$string:EntryAbility_label",
+        "startWindowIcon": "$media:app_icon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "metadata": [
+          {
+            "name": "enable.remove.starting.window",
+            "value": "true"
+          }
+        ],
+        "continuable": true
+      }
+    ]
+  }
+}

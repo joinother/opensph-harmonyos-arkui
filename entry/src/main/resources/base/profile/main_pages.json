@@ -1,0 +1,9 @@
+{
+  "src": [
+    "pages/ArkMain",
+    "pages/MainWindowNativeNode",
+    "pages/SubWindowNativeNode",
+    "pages/FloatWindowNativeNode",
+    "pages/PreviewWindow"
+  ]
+}

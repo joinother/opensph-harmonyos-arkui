@@ -1,0 +1,23 @@
+# 构建产物
+.cxx/
+**/.cxx/
+/build/
+/entry/build/
+/.hvigor/
+/oh_modules/
+/entry/oh_modules/
+*.har
+*.hap
+
+# 预编译原生库（体积大，需按 README 自行构建）
+/entry/libs/
+/entry/src/main/cpp/libs/
+
+# 签名与证书（含私钥，绝不入库）
+/.certs/
+/signing/
+
+# IDE
+/.idea/
+*.iml
+.DS_Store
