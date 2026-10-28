@@ -49,6 +49,66 @@ static std::map<int, bool> g_splatDirty;
 using namespace Sph;
 
 // ---------------------------------------------------------------------------
+// 球面纹理：ArkTS 侧把贴图解码成 RGBA 后传进来，这里按球面 UV 做双线性采样。
+// UV 约定：u = 0.5 + atan2(z, x)/2π，v = 0.5 - asin(y/r)/π（v 向上）。
+// ---------------------------------------------------------------------------
+// 双纹理槽：0 = 主天体（地球），1 = 次天体（月球）
+static std::vector<uint8_t> g_tex[2];
+static int g_texW[2] = { 0, 0 };
+static int g_texH[2] = { 0, 0 };
+
+static void setTextureData(const int slot, const int w, const int h, const uint8_t* src) {
+    const int i = (slot >= 0 && slot < 2) ? slot : 0;
+    if (w <= 0 || h <= 0 || src == nullptr) {
+        g_tex[i].clear();
+        g_texW[i] = g_texH[i] = 0;
+        return;
+    }
+    g_tex[i].assign(src, src + size_t(w) * size_t(h) * 4);
+    g_texW[i] = w;
+    g_texH[i] = h;
+}
+
+/// 双线性采样；返回 false 表示没有纹理
+static bool sampleTexture(const int slot, const double u, const double v,
+    double& outR, double& outG, double& outB) {
+    const int si = (slot >= 0 && slot < 2) ? slot : 0;
+    if (g_texW[si] <= 0 || g_texH[si] <= 0 || g_tex[si].empty()) {
+        return false;
+    }
+    std::vector<uint8_t>& texBuf = g_tex[si];
+    const int texW = g_texW[si];
+    const int texH = g_texH[si];
+    double uu = u - std::floor(u);
+    double vv = v - std::floor(v);
+    const double x = uu * double(texW) - 0.5;
+    const double y = vv * double(texH) - 0.5;
+    const int x0 = int(std::floor(x));
+    const int y0 = int(std::floor(y));
+    const double fx = x - double(x0);
+    const double fy = y - double(y0);
+    const int x1 = (x0 + 1) % texW;
+    const int y1 = (y0 + 1) % texH;
+    const int xa = ((x0 % texW) + texW) % texW;
+    const int ya = ((y0 % texH) + texH) % texH;
+    auto tex = [&](const int px, const int py, double& r, double& gg, double& b) {
+        const size_t o = (size_t(py) * size_t(texW) + size_t(px)) * 4;
+        r = double(texBuf[o]) / 255.0;
+        gg = double(texBuf[o + 1]) / 255.0;
+        b = double(texBuf[o + 2]) / 255.0;
+    };
+    double r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
+    tex(xa, ya, r00, g00, b00);
+    tex(x1, ya, r10, g10, b10);
+    tex(xa, y1, r01, g01, b01);
+    tex(x1, y1, r11, g11, b11);
+    outR = (r00 * (1 - fx) + r10 * fx) * (1 - fy) + (r01 * (1 - fx) + r11 * fx) * fy;
+    outG = (g00 * (1 - fx) + g10 * fx) * (1 - fy) + (g01 * (1 - fx) + g11 * fx) * fy;
+    outB = (b00 * (1 - fx) + b10 * fx) * (1 - fy) + (b01 * (1 - fx) + b11 * fx) * fy;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // C++ 侧点云光栅化：Canvas 2D 每帧绘制成本太高（实测 1333 点约 19ms、
 // 4000 点会卡死），把 splat 放到 C++ 里做，一帧计算出 RGBA 缓冲交给 ArkTS
 // 转成 PixelMap 显示，可支撑数千点 60fps。
@@ -68,6 +128,15 @@ static void splatPoints(const std::vector<float>& pts,
         out[i + 3] = 255;
     }
     const size_t n = pts.size() / 3;
+    {
+        static int logged = 0;
+        if (logged < 3) {
+            logged += 1;
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHTex",
+                "splat sees tex0 %{public}d x %{public}d bytes=%{public}zu tex1 %{public}d x %{public}d pts=%{public}zu",
+                g_texW[0], g_texH[0], g_tex[0].size(), g_texW[1], g_texH[1], n);
+        }
+    }
     if (n == 0) {
         return;
     }
@@ -102,25 +171,112 @@ static void splatPoints(const std::vector<float>& pts,
 
     struct Sample {
         float sx, sy, depth, rr;
+        float bx, by, bz;   // 物体空间单位方向（用于球面 UV）
+        int grp;            // 所属天体（0/1）
     };
+    // 双天体分组：用最远点对确定分离轴，按中点为界把采样点分成两组（地球/月球）
+    double axX = 0, axY = 0, axZ = 0, axP = 0;
+    {
+        double c0 = 0, c1 = 0, c2 = 0;
+        for (size_t k = 0; k < n; ++k) {
+            c0 += pts[k * 3]; c1 += pts[k * 3 + 1]; c2 += pts[k * 3 + 2];
+        }
+        c0 /= double(n); c1 /= double(n); c2 /= double(n);
+        double best = -1;
+        for (size_t k = 0; k < n; ++k) {
+            const double dx = pts[k * 3] - c0, dy = pts[k * 3 + 1] - c1, dz = pts[k * 3 + 2] - c2;
+            const double d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > best) { best = d2; axX = pts[k * 3]; axY = pts[k * 3 + 1]; axZ = pts[k * 3 + 2]; }
+        }
+        best = -1;
+        for (size_t k = 0; k < n; ++k) {
+            const double dx = pts[k * 3] - axX, dy = pts[k * 3 + 1] - axY, dz = pts[k * 3 + 2] - axZ;
+            const double d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > best) { best = d2; axP = d2; }
+        }
+    }
+    // 组 0 / 组 1 的中心与半径（世界坐标）
+    double gcx[2] = { 0, 0 }, gcy[2] = { 0, 0 }, gcz[2] = { 0, 0 };
+    double grd[2] = { 0, 0 };
+    int gcnt[2] = { 0, 0 };
+    {
+        // 以 axX.. 与质心的中点连线做投影轴
+        double cx0 = 0, cy0 = 0, cz0 = 0;
+        for (size_t k = 0; k < n; ++k) { cx0 += pts[k * 3]; cy0 += pts[k * 3 + 1]; cz0 += pts[k * 3 + 2]; }
+        cx0 /= double(n); cy0 /= double(n); cz0 /= double(n);
+        double ux = axX - cx0, uy = axY - cy0, uz = axZ - cz0;
+        const double ul = std::sqrt(ux * ux + uy * uy + uz * uz) + 1e-9;
+        ux /= ul; uy /= ul; uz /= ul;
+        for (size_t k = 0; k < n; ++k) {
+            const double d = (pts[k * 3] - cx0) * ux + (pts[k * 3 + 1] - cy0) * uy + (pts[k * 3 + 2] - cz0) * uz;
+            const int g = d >= 0 ? 1 : 0;
+            gcnt[g] += 1;
+            gcx[g] += pts[k * 3]; gcy[g] += pts[k * 3 + 1]; gcz[g] += pts[k * 3 + 2];
+        }
+        for (int g = 0; g < 2; ++g) {
+            if (gcnt[g] > 0) {
+                gcx[g] /= double(gcnt[g]); gcy[g] /= double(gcnt[g]); gcz[g] /= double(gcnt[g]);
+            }
+        }
+        for (size_t k = 0; k < n; ++k) {
+            const double d = (pts[k * 3] - cx0) * ux + (pts[k * 3 + 1] - cy0) * uy + (pts[k * 3 + 2] - cz0) * uz;
+            const int g = d >= 0 ? 1 : 0;
+            const double dx = pts[k * 3] - gcx[g], dy = pts[k * 3 + 1] - gcy[g], dz = pts[k * 3 + 2] - gcz[g];
+            grd[g] = std::max(grd[g], std::sqrt(dx * dx + dy * dy + dz * dz));
+        }
+    }
+
     std::vector<Sample> samples(n);
     for (size_t k = 0; k < n; ++k) {
+        // 组号：与聚类一致的投影判据
+        double grpAxis = 0;
+        {
+            double cx0 = 0, cy0 = 0, cz0 = 0;
+            // 用整团质心近似（误差可接受，仅用于分组）
+            cx0 = cx; cy0 = cy; cz0 = cz;
+            grpAxis = (pts[k * 3] - cx0) * (axX - cx0) + (pts[k * 3 + 1] - cy0) * (axY - cy0)
+                + (pts[k * 3 + 2] - cz0) * (axZ - cz0);
+        }
+        const int grp = grpAxis >= 0 ? 1 : 0;
+        samples[k].grp = grp;
         const double x0 = pts[k * 3] - cx, y0 = pts[k * 3 + 1] - cy, z0 = pts[k * 3 + 2] - cz;
         const double x1 = x0 * ca - y0 * sa;
         const double y1 = x0 * sa + y0 * ca;
         const double y2 = y1 * ct - z0 * st;
         const double z2 = y1 * st + z0 * ct;
-        samples[k].sx = float(double(W) * 0.5 + x1 * scale);
-        samples[k].sy = float(double(H) * 0.5 - z2 * scale);
+        // 抖动：打散粒子晶格与像素栅格的对齐，消除叠加混合产生的摩尔纹
+        auto hash01 = [](size_t i, unsigned salt) -> double {
+            size_t x = i * 0x9E3779B97F4A7C15ULL + salt * 0xBF58476D1CE4E5B9ULL;
+            x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ULL;
+            x ^= x >> 27; x *= 0x94D049BB133111EBULL;
+            x ^= x >> 31;
+            return double(x & 0xFFFFFF) / double(0x1000000);
+        };
+        const double jr = std::min(6.0, 0.55 * (double(std::min(W, H)) * 0.42 / radius)
+            / std::sqrt(double(n) > 1.0 ? double(n) : 1.0) * 2.2);
+        const double jx = (hash01(k, 1u) - 0.5) * 2.0 * jr;
+        const double jy = (hash01(k, 2u) - 0.5) * 2.0 * jr;
+        samples[k].sx = float(double(W) * 0.5 + x1 * scale + jx);
+        samples[k].sy = float(double(H) * 0.5 - z2 * scale + jy);
         samples[k].depth = float(y2 / radius);
-        samples[k].rr = float(std::sqrt(x0 * x0 + y0 * y0 + z0 * z0) / radius);
+        const double rl = std::sqrt(x0 * x0 + y0 * y0 + z0 * z0) + 1e-9;
+        samples[k].rr = float(rl / radius);
+        samples[k].bx = float(x0 / rl);
+        samples[k].by = float(y0 / rl);
+        samples[k].bz = float(z0 / rl);
     }
     std::sort(samples.begin(), samples.end(), [](const Sample& a, const Sample& b) {
         return a.depth < b.depth;
     });
 
-    const float baseR = std::max(1.5f, float(std::min(W, H)) * 0.0042f)
-        * std::min(2.4f, std::max(1.0f, std::sqrt(1200.0f / float(n))));
+    // 半径按像素密度缩放：4K 小边 2160px，需要更大的 splat 才能覆盖成连续表面
+    // z-buffer：最近点胜出。加法混合会让「叠加次数」差异变成蜂窝条纹，
+    // 最近点写法则直接取最外层粒子的颜色，条纹消失且物理上更合理。
+    std::vector<float> zbuf(size_t(W) * size_t(H), -2.0f);
+
+    const float resBoost = std::min(2.2f, std::max(1.0f, float(std::min(W, H)) / 1080.0f));
+    const float baseR = std::max(1.5f, float(std::min(W, H)) * 0.0042f) * resBoost * 1.55f
+        * std::min(2.4f, std::max(1.0f, std::sqrt(1200.0f / float(n)))) * 0.85f;
     for (const Sample& sm : samples) {
         // 法线近似：屏幕空间中心指向该点（球/椭球精确）
         double nx = (sm.sx - double(W) * 0.5) / (scale * radius + 1e-6);
@@ -135,9 +291,19 @@ static void splatPoints(const std::vector<float>& pts,
         const double hn = std::sqrt(hx * hx + hy * hy + hz * hz);
         const double spec = std::pow(std::max(0.0, (nx * hx + ny * hy + nz * hz) / hn), 16.0);
         const double dn = (sm.depth + 1.0) * 0.5;
-        const double lum = std::min(1.0, 0.22 + 0.95 * diff + 0.35 * spec);
-        const double t = std::min(1.0, double(sm.rr));
+        const double lum = std::min(1.15, 0.34 + 0.95 * diff + 0.35 * spec);
+        // 球面 UV：用物体空间方向（纹理随天体一起旋转）
+        const double uu = 0.5 + std::atan2(double(sm.bz), double(sm.bx)) / (2.0 * 3.14159265358979);
+        const double vv = 0.5 - std::asin(std::max(-1.0, std::min(1.0, double(sm.by)))) / 3.14159265358979;
+        double tr, tg, tb;
         double mr, mg, mb;
+        const bool hasTex = sampleTexture(0, uu, vv, tr, tg, tb);
+        if (hasTex) {
+            mr = tr * 255.0;
+            mg = tg * 255.0;
+            mb = tb * 255.0;
+        } else {
+        const double t = std::min(1.0, double(sm.rr));
         if (t < 0.35) {
             const double u = t / 0.35;
             mr = 40 + 130 * u; mg = 10 + 30 * u; mb = 105 + 20 * u;
@@ -148,10 +314,12 @@ static void splatPoints(const std::vector<float>& pts,
             const double u = (t - 0.7) / 0.3;
             mr = 245 + 10 * u; mg = 130 + 110 * u; mb = 70 + 120 * u;
         }
-        const double cr = std::min(255.0, mr * lum + 240 * spec);
-        const double cg = std::min(255.0, mg * lum + 240 * spec);
-        const double cb = std::min(255.0, mb * lum + 230 * spec);
-        const double alpha = 0.10 + 0.30 * dn + 0.30 * spec;
+        }
+        const double texGain = hasTex ? 1.55 : 1.0;
+        const double cr = std::min(255.0, mr * lum * texGain + 240 * spec);
+        const double cg = std::min(255.0, mg * lum * texGain + 240 * spec);
+        const double cb = std::min(255.0, mb * lum * texGain + 230 * spec);
+        const double alpha = 0.07 + 0.20 * dn + 0.22 * spec;
         const int ir = std::max(1, int(std::lround(baseR * (0.6f + 0.8f * dn))));
         const int px0 = int(std::lround(sm.sx));
         const int py0 = int(std::lround(sm.sy));
@@ -169,11 +337,86 @@ static void splatPoints(const std::vector<float>& pts,
                 if (d2 > double(ir * ir)) {
                     continue;
                 }
-                const double w = (1.0 - std::sqrt(d2) / (ir + 1e-6)) * alpha;
-                const size_t o = (size_t(py) * size_t(W) + size_t(px)) * 4;
-                out[o] = uint8_t(std::min(255.0, out[o] + cr * w));
-                out[o + 1] = uint8_t(std::min(255.0, out[o + 1] + cg * w));
-                out[o + 2] = uint8_t(std::min(255.0, out[o + 2] + cb * w));
+                const size_t zi = size_t(py) * size_t(W) + size_t(px);
+                if (double(sm.depth) <= double(zbuf[zi])) {
+                    continue;   // 被更近的粒子遮挡
+                }
+                zbuf[zi] = sm.depth;
+                // 最近点着色：整盘同色，不按到中心的距离提亮，
+                // 否则每个粒子都会变成一个可见的「泡泡」，表面出现蜂窝鼓包。
+                const double shade = 1.0;
+                const size_t o = zi * 4;
+                out[o] = uint8_t(std::min(255.0, cr * shade));
+                out[o + 1] = uint8_t(std::min(255.0, cg * shade));
+                out[o + 2] = uint8_t(std::min(255.0, cb * shade));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 逐像素着色：splat 只负责铺出深度图，颜色在这里按像素重算。
+    // 若按粒子着色，每颗粒子会变成一块同色圆盘（放大后是「波点球」），
+    // 纹理细节全被抹平；按像素着色才能得到连续的球面与真实纹理。
+    // ---------------------------------------------------------------------
+    if (!g_tex[0].empty() || !g_tex[1].empty()) {
+        const double cxPix = double(W) * 0.5;
+        const double cyPix = double(H) * 0.5;
+        const double rPix = scale * radius;
+        // 相机空间法线 → 物体空间（恢复纹理随天体旋转的正确 UV）
+        auto camToBody = [&](double nx, double ny, double nz, double& bx, double& by, double& bz) {
+            const double y1 = ny * ct + nz * st;
+            const double z0 = nz * ct - ny * st;
+            bx = nx * ca + y1 * sa;
+            by = -nx * sa + y1 * ca;
+            bz = z0;
+        };
+        for (int py = 0; py < H; ++py) {
+            for (int px = 0; px < W; ++px) {
+                const size_t zi = size_t(py) * size_t(W) + size_t(px);
+                if (zbuf[zi] <= -1.5f) {
+                    continue;
+                }
+                // 球面法线（对球/椭球精确）；轮廓外由深度梯度兜底
+                double nx = (double(px) + 0.5 - cxPix) / rPix;
+                double ny = (double(py) + 0.5 - cyPix) / rPix;
+                const double r2 = nx * nx + ny * ny;
+                double nz;
+                if (r2 < 0.999) {
+                    nz = std::sqrt(1.0 - r2);
+                } else {
+                    // 轮廓边缘/碎片：用深度梯度
+                    const float dL = px > 0 ? zbuf[zi - 1] : zbuf[zi];
+                    const float dR = px + 1 < W ? zbuf[zi + 1] : zbuf[zi];
+                    const float dU = py > 0 ? zbuf[zi - W] : zbuf[zi];
+                    const float dD = py + 1 < H ? zbuf[zi + W] : zbuf[zi];
+                    const double gx = double(dR - dL) * 3.0;
+                    const double gy = double(dD - dU) * 3.0;
+                    const double gl = std::sqrt(gx * gx + gy * gy + 1e-6);
+                    nx = -gx / gl;
+                    ny = -gy / gl;
+                    nz = 1.0 / gl;
+                }
+                const double nn = std::sqrt(nx * nx + ny * ny + nz * nz) + 1e-9;
+                nx /= nn; ny /= nn; nz /= nn;
+                double bx, by, bz;
+                camToBody(nx, ny, nz, bx, by, bz);
+                const double uu = 0.5 + std::atan2(bz, bx) / (2.0 * 3.14159265358979);
+                const double vv = 0.5 - std::asin(std::max(-1.0, std::min(1.0, by))) / 3.14159265358979;
+                double tr = 0.75, tg = 0.75, tb = 0.72;
+                sampleTexture(0, uu, vv, tr, tg, tb);
+                const double diff = std::max(0.0, nx * lx + ny * ly + nz * lz);
+                double hx = lx, hy = ly, hz = lz + 1.0;
+                const double hn = std::sqrt(hx * hx + hy * hy + hz * hz);
+                const double spec = std::pow(std::max(0.0, (nx * hx + ny * hy + nz * hz) / hn), 22.0);
+                const double amb = 0.16;
+                const double shade = std::min(1.25, amb + 0.95 * diff);
+                const size_t o = zi * 4;
+                const double rr = tr * 255.0 * shade + 200.0 * spec;
+                const double gg = tg * 255.0 * shade + 200.0 * spec;
+                const double bb = tb * 255.0 * shade + 200.0 * spec;
+                out[o] = uint8_t(std::min(255.0, rr));
+                out[o + 1] = uint8_t(std::min(255.0, gg));
+                out[o + 2] = uint8_t(std::min(255.0, bb));
             }
         }
     }
@@ -1154,6 +1397,37 @@ napi_value previewPoints(napi_env env, napi_callback_info info) {
 }
 
 
+napi_value setTexture(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t slot = 0, w = 0, h = 0;
+    napi_value ab = nullptr;
+    if (argc >= 4) {
+        napi_get_value_int32(env, argv[0], &slot);
+        napi_get_value_int32(env, argv[1], &w);
+        napi_get_value_int32(env, argv[2], &h);
+        ab = argv[3];
+    } else {
+        napi_get_value_int32(env, argv[0], &w);
+        napi_get_value_int32(env, argv[1], &h);
+        ab = argv[2];
+    }
+    void* data = nullptr;
+    size_t bytes = 0;
+    if (napi_get_arraybuffer_info(env, ab, &data, &bytes) != napi_ok || data == nullptr) {
+        return makeString(env, "{\"ok\":false,\"error\":\"无效的纹理数据\"}");
+    }
+    if (bytes < size_t(w) * size_t(h) * 4) {
+        return makeString(env, "{\"ok\":false,\"error\":\"纹理尺寸不匹配\"}");
+    }
+    setTextureData(slot, w, h, static_cast<const uint8_t*>(data));
+    const int si = (slot >= 0 && slot < 2) ? slot : 0;
+    return makeString(env, "{\"ok\":true,\"slot\":" + std::to_string(si)
+        + ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h)
+        + ",\"stored\":" + std::to_string(g_tex[si].size()) + "}");
+}
+
 napi_value renderSplat(napi_env env, napi_callback_info info) {
     size_t argc = 5;
     napi_value argv[5];
@@ -1792,6 +2066,259 @@ public:
 
 };
 
+
+// ---------------------------------------------------------------------------
+// 模拟 → 离线渲染：跑 SPH 模拟的同时，按目标 fps 在时间轴上切帧并渲染成视频。
+// 与「静态几何导出」的区别是每帧的粒子位置都来自模拟的真实演化。
+// ---------------------------------------------------------------------------
+struct SimExportState {
+    std::atomic<bool> active{false};
+    std::atomic<int> rendered{0};
+    std::atomic<bool> failed{false};
+    int total = 0;
+    std::string error;
+};
+
+static SimExportState& simExportState() {
+    static SimExportState st;
+    return st;
+}
+
+/// 用当前粒子位置渲染一帧并推给编码器
+static bool renderSimFrame(const std::vector<float>& pts, const double yaw, const double pitch,
+    const int w, const int h, VideoWriter& writer, String& err) {
+    {
+        static int logged = 0;
+        if (logged < 2) {
+            logged += 1;
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHSimExp",
+                "frame %{public}dx%{public}d points=%{public}zu", w, h, pts.size() / 3);
+        }
+    }
+    std::vector<uint8_t> rgba;
+    splatPoints(pts, float(yaw), float(pitch), w, h, rgba);
+    if (rgba.size() != size_t(w) * size_t(h) * 4) {
+        err = String::fromUtf8("渲染缓冲尺寸不匹配");
+        return false;
+    }
+    Bitmap<Rgba> frame(Pixel(w, h));
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t o = (size_t(y) * size_t(w) + size_t(x)) * 4;
+            frame[Pixel(x, y)] = Rgba(float(rgba[o]) / 255.f,
+                float(rgba[o + 1]) / 255.f, float(rgba[o + 2]) / 255.f, 1.f);
+        }
+    }
+    return writer.pushFrame(frame, err);
+}
+
+class SimExportCallbacks : public IJobCallbacks {
+private:
+    SimExportState& state;
+    VideoWriter& writer;
+    const int width;
+    const int height;
+    const int total;
+    const double dt;
+    double nextFrameTime = 0;
+
+public:
+    SimExportCallbacks(SimExportState& state, VideoWriter& writer, const int w, const int h,
+        const int total, const double duration)
+        : state(state), writer(writer), width(w), height(h), total(total),
+          dt(duration > 0 ? duration / double(std::max(1, total)) : 1.0 / 60.0) {}
+
+    virtual void onStart(const IJob&) override {}
+    virtual void onEnd(const Storage&, const Statistics&) override {}
+    virtual void onSetUp(const Storage&, Statistics&) override {}
+
+    virtual bool shouldAbortRun() const override {
+        // 渲染失败或被要求停止时，让模拟尽早收尾
+        return state.failed.load();
+    }
+
+    virtual void onTimeStep(const Storage& storage, Statistics& stats) override {
+        if (state.failed.load() || state.rendered.load() >= total) {
+            return;
+        }
+        double t = 0;
+        if (stats.has(StatisticsId::RUN_TIME)) {
+            t = double(stats.get<Float>(StatisticsId::RUN_TIME));
+        }
+        if (storage.getParticleCnt() == 0) {
+            return;
+        }
+        // 按时间轴切帧：模拟步长可能比帧间隔更细或更粗，这里保证帧数严格等于 total
+        while (nextFrameTime <= t + 1e-12 && state.rendered.load() < total) {
+            std::vector<float> pts;
+            try {
+                ArrayView<const Vector> r = storage.getValue<Vector>(QuantityId::POSITION);
+                const Size cnt = r.size();
+                const Size step = cnt > Size(60000) ? cnt / Size(60000) : 1;
+                pts.reserve(size_t(cnt / step + 1) * 3);
+                for (Size i = 0; i < cnt; i += step) {
+                    pts.push_back(float(r[i][0]));
+                    pts.push_back(float(r[i][1]));
+                    pts.push_back(float(r[i][2]));
+                }
+            } catch (...) {
+                return;
+            }
+            const int f = state.rendered.load();
+            const double yaw = 0.35 + 0.25 * double(f) / double(std::max(1, total));
+            String err;
+            if (!renderSimFrame(pts, yaw, 0.42, width, height, writer, err)) {
+                state.error = err.toUtf8().cstr();
+                state.failed.store(true);
+                return;
+            }
+            const int done = state.rendered.fetch_add(1) + 1;
+            if (done % 10 == 0 || done == total) {
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHSimExp",
+                    "progress %{public}d/%{public}d simTime=%{public}.1fs", done, total, t);
+            }
+            nextFrameTime += dt;
+        }
+    }
+};
+
+napi_value startSimExport(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t handle = -1;
+    napi_get_value_int32(env, argv[0], &handle);
+    char options[1024] = {0};
+    size_t len = 0;
+    if (argc > 1) {
+        napi_get_value_string_utf8(env, argv[1], options, sizeof(options), &len);
+    }
+    const std::string optStr(options, len);
+
+    SimExportState& st = simExportState();
+    if (st.active.load()) {
+        return makeString(env, "{\"ok\":false,\"error\":\"已有渲染任务在进行\"}");
+    }
+    const auto it = nodeRegistry().find(handle);
+    if (it == nodeRegistry().end()) {
+        return makeString(env, "{\"ok\":false,\"error\":\"节点不存在\"}");
+    }
+    SharedPtr<JobNode> node = it->second;
+    if (!dynamic_cast<IRunJob*>(node->getJob().get())) {
+        return makeString(env, "{\"ok\":false,\"error\":\"该节点不是模拟作业\"}");
+    }
+
+    // 解析选项
+    auto readInt = [&optStr](const char* key, const int def) -> int {
+        const std::string k = std::string("\"") + key + "\"";
+        const size_t p = optStr.find(k);
+        if (p == std::string::npos) {
+            return def;
+        }
+        const size_t c = optStr.find(':', p);
+        if (c == std::string::npos) {
+            return def;
+        }
+        return std::atoi(optStr.c_str() + c + 1);
+    };
+    auto readStr = [&optStr](const char* key) -> std::string {
+        const std::string k = std::string("\"") + key + "\"";
+        const size_t p = optStr.find(k);
+        if (p == std::string::npos) {
+            return std::string();
+        }
+        const size_t q1 = optStr.find('"', optStr.find(':', p) + 1);
+        if (q1 == std::string::npos) {
+            return std::string();
+        }
+        const size_t q2 = optStr.find('"', q1 + 1);
+        if (q2 == std::string::npos) {
+            return std::string();
+        }
+        return optStr.substr(q1 + 1, q2 - q1 - 1);
+    };
+
+    const int width = std::max(64, std::min(readInt("width", 1920), 3840));
+    const int height = std::max(64, std::min(readInt("height", 1080), 2160));
+    const int fps = std::max(1, std::min(readInt("fps", 60), 60));
+    const int total = std::max(1, std::min(readInt("frames", 300), 3600));
+    const int bitrate = std::max(1000000, readInt("bitrate", 20000000));
+    double duration = 0;
+    {
+        const std::string k = "\"duration\"";
+        const size_t p = optStr.find(k);
+        if (p != std::string::npos) {
+            duration = std::atof(optStr.c_str() + optStr.find(':', p) + 1);
+        }
+    }
+    if (duration <= 0) {
+        duration = double(total) / double(fps);
+    }
+    const std::string path = readStr("path");
+
+    {
+        st.active.store(true);
+        st.rendered.store(0);
+        st.failed.store(false);
+        st.total = total;
+        st.error.clear();
+    }
+
+    std::thread worker([node, width, height, fps, total, bitrate, duration, path]() {
+        SimExportState& st = simExportState();
+        VideoWriter writer;
+        VideoParams params;
+        params.width = width;
+        params.height = height;
+        params.fps = fps;
+        params.bitrate = bitrate;
+        String openError;
+        if (!writer.open(Path(String::fromUtf8(path.c_str())), params, openError)) {
+            st.error = openError.toUtf8().cstr();
+            st.failed.store(true);
+            st.active.store(false);
+            return;
+        }
+        try {
+            SharedPtr<JobNode> clone = cloneHierarchy(*node, String(""));
+            RawPtr<IRunJob> runJob = dynamic_cast<IRunJob*>(clone->getJob().get());
+            if (!runJob) {
+                throw Exception("节点不是可运行的模拟作业");
+            }
+            RunSettings globals = EMPTY_SETTINGS;
+            globals.set(RunSettingsId::RUN_THREAD_CNT, 0);
+            globals.set(RunSettingsId::RUN_THREAD_GRANULARITY, 1000);
+            globals.set(RunSettingsId::RUN_RNG, RngEnum::UNIFORM);
+            globals.set(RunSettingsId::RUN_RNG_SEED, 1234);
+            globals.set(RunSettingsId::RUN_END_TIME, Float(duration));
+            SimExportCallbacks callbacks(st, writer, width, height, total, duration);
+            clone->run(globals, callbacks);
+            if (!st.failed.load()) {
+                String closeError;
+                writer.close(closeError);
+            }
+        } catch (const std::exception& e) {
+            st.error = String::fromUtf8(e.what()).toUtf8().cstr();
+            st.failed.store(true);
+            String closeError;
+            writer.close(closeError);
+        }
+        st.active.store(false);
+    });
+    worker.detach();
+    return makeString(env, "{\"ok\":true,\"frames\":" + std::to_string(total) + "}");
+}
+
+napi_value simExportStatus(napi_env env, napi_callback_info) {
+    SimExportState& st = simExportState();
+    std::string json = "{\"active\":" + std::string(st.active.load() ? "true" : "false")
+        + ",\"rendered\":" + std::to_string(st.rendered.load())
+        + ",\"total\":" + std::to_string(st.total)
+        + ",\"failed\":" + std::string(st.failed.load() ? "true" : "false")
+        + ",\"error\":\"" + jsonEscape(String::fromUtf8(st.error.c_str())) + "\"}";
+    return makeString(env, json);
+}
+
 napi_value runSimulation(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value argv[2];
@@ -2036,7 +2563,10 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"releaseNode", nullptr, releaseNode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"previewPoints", nullptr, previewPoints, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"renderSplat", nullptr, renderSplat, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setTexture", nullptr, setTexture, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportCloudVideo", nullptr, exportCloudVideo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"startSimExport", nullptr, startSimExport, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"simExportStatus", nullptr, simExportStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startExportVideo", nullptr, startExportVideo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportStatus", nullptr, exportStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startRecording", nullptr, startRecording, nullptr, nullptr, nullptr, napi_default, nullptr},

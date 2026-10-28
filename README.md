@@ -78,3 +78,33 @@ hdc shell aa start -a QAbility -b com.opensph.app
 ## 许可
 
 界面与桥接代码：随上游保持一致。OpenSPH 内核版权归其原作者（Pavel Ševeček）。
+
+## 纹理渲染与过程视频（新增）
+
+### 球面纹理
+- C++ 侧 `splatPoints` 采用两阶段：粒子只负责铺**深度图**，颜色按**逐像素**重建法线后采样贴图（否则每颗粒子会变成一块同色圆盘，放大后是"波点球"）。
+- UV 由法线反旋转回**物体空间**再计算（`u = 0.5 + atan2(z,x)/2π`、`v = 0.5 − asin(y/r)/π`），所以贴图随天体自转，而不是跟着相机滑动。
+- 支持**双纹理槽**（`setTexture(slot, w, h, rgba)`）：主天体/次天体各用一张贴图，采样点按"最远点对"聚类分成两组，各自算球心与半径。
+- 内置程序化贴图：类地球（海洋/大陆/极冠/云）、类月球（月海 + 90 个环形山，中心暗边缘亮），1024×512 等距圆柱，无版权问题、体积为零。
+
+### 模拟驱动的离线渲染
+- `startSimExport(handle, options)`：在模拟的 `onTimeStep` 里按时间轴切帧（`dt = duration / frames`），每帧取当前粒子位置渲染，因此每帧都来自真实演化，而不是旋转静态几何。
+- 分辨率/帧率/帧数/码率/时长可配；实测 3840×2160、60fps、600 帧可用。
+- 进度可用 `simExportStatus()` 轮询（`rendered / total`）。
+
+### 洛希极限场景（构建器）
+`buildRocheScenario()` 用已注册作业类名程序化搭图（不经 gui 层，避免 Presets 的 wx 依赖）：
+
+```
+地球 IC ─→ join(particles A) ─→ SPH run（Barnes-Hut 自引力 + Grady-Kipp 碎裂）
+月球 IC ─→ transform(offset) ─→ set Keplerian velocity ─→ join(particles B)
+```
+
+关键点：
+- 轨道速度必须用 `set Keplerian velocity`（以地球为引力源）计算 `v = √(GM/r)`；用 `join` 的 `velocity` 参数是**整系统偏移速度**，不会产生绕转。
+- `join` 必须显式 `com=false`，否则质心归零会让两天体互相靠拢。
+- 物理时间尺度是小时级（地球密度对应动力时间 ~20 分钟），因此验证时可用「整体放大天体」降低数密度来提速（实测约 3.6 倍）。
+
+### 已知限制
+- 通过桥接 `setNodeSetting(handle, 'particles.count', ...)` 修改粒子数**不生效**（readback 恒为默认 10000）；只有 UI 输入框修改才生效。
+- 1 秒墙钟约推进 1.2 秒模拟（2.1 万粒子 + Barnes-Hut + 损伤模型 + CFL 小步长），这是当前唯一的速度瓶颈。

@@ -311,6 +311,7 @@ struct ArkMain {
   @State private settings: SettingCategory[] = [];
   @State private pendingValue: string = '';
   private pendingByKey: Map<string, string> = new Map<string, string>();
+  @State private textureName: string = '';
   private pendingTimers: Map<string, number> = new Map<string, number>();
   @State private toasts: AppNotice[] = [];
   @State private history: AppNotice[] = [];
@@ -456,6 +457,12 @@ struct ArkMain {
     const ctx: CanvasRenderingContext2D = this.previewCtx;
     const W: number = ctx.width;
     const H: number = ctx.height;
+    // C++ 渲染结果由 Stack 里的 Image 显示；Canvas 在其上层，必须清空并让位，
+    // 否则 Canvas 每帧画的不透明背景会把 Image 完全盖住（之前纹理看不到就是这个原因）。
+    if (this.previewPix !== null) {
+      ctx.clearRect(0, 0, W, H);
+      return;
+    }
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = '#101418';
     ctx.fillRect(0, 0, W, H);
@@ -624,6 +631,7 @@ struct ArkMain {
       return;
     }
     const key: string = `${handle}:${yaw.toFixed(3)}:${pitch.toFixed(3)}`;
+    hilog.info(0x0000, 'OpenSPHPix', `enter handle=${handle} sel=${this.selectedNode} busy=${this.previewPixBusy} key=${key} last=${this.lastPixKey}`);
     if (!force && key === this.lastPixKey) {
       return;
     }
@@ -640,6 +648,7 @@ struct ArkMain {
       const buf: ArrayBuffer = ark.renderSplat(handle, yaw, pitch, W, H) as ArrayBuffer;
       const dtCpp: number = Date.now() - tCpp;
       if (buf === undefined || buf === null || buf.byteLength !== W * H * 4) {
+        hilog.warn(0x0000, 'OpenSPHPix', `bad buffer len=${buf === undefined || buf === null ? -1 : buf.byteLength} expect=${W * H * 4}`);
         this.previewPixBusy = false;
         return;
       }
@@ -651,11 +660,13 @@ struct ArkMain {
       const tPm: number = Date.now();
       let pm: image.PixelMap | null = this.previewPix;
       if (pm === null || this.previewPixW !== W || this.previewPixH !== H) {
-        pm = await image.createPixelMap(buf, opts);
+        // 用同步 API：await createPixelMap 在实机上会出现不返回（busy 卡死）的情况
+        pm = image.createPixelMapSync(buf, opts);
         this.previewPixW = W;
         this.previewPixH = H;
+        hilog.info(0x0000, 'OpenSPHPix', `created PixelMap ${W}x${H} sync`);
       } else {
-        await pm.writeBufferToPixels(buf);
+        pm.writeBufferToPixelsSync(buf);
       }
       const dtPm: number = Date.now() - tPm;
       this.previewPix = pm;
@@ -847,6 +858,7 @@ struct ArkMain {
 
   aboutToAppear(): void {
     this.loadMotionPref();
+    setTimeout(() => { this.uploadTexture(this.textureKind); }, 1200);
     this.readSystemMotionPref();
     this.calcPaneListHeight();
     this.loadPaneWidths();
@@ -902,6 +914,271 @@ struct ArkMain {
   }
 
   // 一键预设：把「方向/分辨率/帧率/画质/时长」一次配好，省掉逐项点选
+  // 用「模拟逐帧渲染」导出：每帧粒子位置来自真实演化（区别于静态几何导出）
+  // ---------------------------------------------------------------------------
+  // 洛希极限场景构建器：地球 + 月球 → join（位移+初速）→ SPH run（自引力+碎裂）
+  // 全部通过已注册的作业类名搭建，避免触碰 gui 层（Presets 那条路会因依赖 wx 链接失败）。
+  // ---------------------------------------------------------------------------
+  private setNodeFloat(handle: number, key: string, value: number, type: string): void {
+    try {
+      ark.setNodeSetting(handle, key, String(value), type);
+    } catch (e) {
+      hilog.warn(0x0000, 'OpenSPHRoche', `set ${key}=${value} failed`);
+    }
+  }
+
+  private rocheNode(className: string, title: string, x: number, y: number): GraphNode | null {
+    let handle: number = -1;
+    try {
+      handle = Number(ark.createNode(className));
+    } catch (e) {
+      return null;
+    }
+    if (handle < 0) {
+      return null;
+    }
+    // 先强制实例化设置对象，否则紧随其后的 setNodeSetting 会被静默忽略
+    try {
+      const _warm: string = String(ark.nodeSettings(handle));
+      if (_warm.length === 0) {
+        hilog.warn(0x0000, 'OpenSPHRoche', `settings empty for ${className}`);
+      }
+    } catch (e) {
+      hilog.warn(0x0000, 'OpenSPHRoche', `settings warmup failed for ${className}`);
+    }
+    const n: GraphNode = new GraphNode(this.nextId, handle, className,
+      this.nodeTitle(className), this.label('initial conditions'), x, y);
+    this.nextId += 1;
+    this.nodes = this.nodes.concat([n]);
+    return n;
+  }
+
+  private buildRocheScenario(): number {
+    hilog.info(0x0000, 'OpenSPHRoche', 'build start (orbit-correct)');
+    const R_EARTH: number = 12742;        // 放大 2 倍以降低数密度（提速 ~3.6 倍）
+    const R_MOON: number = 3474;
+    const ORBIT: number = 2.6 * R_EARTH;  // 洛希极限（~2.44 R）稍外侧，潮汐会逐渐拉长
+
+    const earth: GraphNode | null = this.rocheNode('create monolithic body', '地球', 60, 80);
+    if (!earth) { return -1; }
+    this.setNodeFloat(earth.handle, 'body.radius', R_EARTH, 'float');
+
+    const moon: GraphNode | null = this.rocheNode('create monolithic body', '月球', 60, 240);
+    if (!moon) { return -1; }
+    this.setNodeFloat(moon.handle, 'body.radius', R_MOON, 'float');
+    try {
+      ark.setNodeSetting(moon.handle, 'rheology.damage', '1', 'enum');
+      ark.setNodeSetting(moon.handle, 'rheology.yielding', '3', 'enum');
+    } catch (e) {
+      hilog.warn(0x0000, 'OpenSPHRoche', 'moon rheology failed');
+    }
+
+    // 把月球平移到轨道半径（transform 的 offset 单位是 km）
+    const shift: GraphNode | null = this.rocheNode('transform', '平移月球', 260, 300);
+    if (!shift) { return -1; }
+    try {
+      ark.setNodeSetting(shift.handle, 'offset', `0,${ORBIT},0`, 'vector');
+    } catch (e) {
+      hilog.warn(0x0000, 'OpenSPHRoche', 'shift offset failed');
+    }
+
+    // 开普勒速度：以地球为引力源，给平移后的月球圆轨道速度
+    const kepler: GraphNode | null = this.rocheNode('set Keplerian velocity', '开普勒速度', 460, 300);
+    if (!kepler) { return -1; }
+
+    // 合并：地球 + 带轨道速度的月球，禁止质心归零（否则两天体会互相靠拢）
+    const join: GraphNode | null = this.rocheNode('join', '合并天体', 660, 160);
+    if (!join) { return -1; }
+    try {
+      ark.setNodeSetting(join.handle, 'com', 'false', 'bool');
+      ark.setNodeSetting(join.handle, 'unique_flags', 'true', 'bool');
+    } catch (e) {
+      hilog.warn(0x0000, 'OpenSPHRoche', 'join flags failed');
+    }
+
+    const run: GraphNode | null = this.rocheNode('SPH run', '模拟运行', 860, 160);
+    if (!run) { return -1; }
+    try {
+      ark.setNodeSetting(run.handle, 'gravity.solver', '2', 'enum');
+      ark.setNodeSetting(run.handle, 'timestep.max_step', '100', 'float');
+    } catch (e) {
+      hilog.warn(0x0000, 'OpenSPHRoche', 'run settings failed');
+    }
+
+    interface OpRes {
+      ok: boolean;
+      error?: string;
+    }
+    const cn = (from: number, to: number, slot: string): boolean => {
+      const r: OpRes = JSON.parse(String(ark.connectNodes(from, to, slot))) as OpRes;
+      if (!r.ok) {
+        hilog.warn(0x0000, 'OpenSPHRoche', `connect ${slot} failed: ${r.error ?? ''}`);
+      }
+      return r.ok;
+    };
+    const ok1 = cn(moon.handle, shift.handle, 'particles');
+    const ok2 = cn(earth.handle, kepler.handle, 'gravity source');
+    const ok3 = cn(shift.handle, kepler.handle, 'orbiting');
+    const ok4 = cn(earth.handle, join.handle, 'particles A');
+    const ok5 = cn(kepler.handle, join.handle, 'particles B');
+    const ok6 = cn(join.handle, run.handle, 'particles');
+    hilog.info(0x0000, 'OpenSPHRoche',
+      `orbit=${ORBIT.toFixed(0)}km conns=${ok1}${ok2}${ok3}${ok4}${ok5}${ok6}`);
+
+    this.selectedNode = run.id;
+    this.loadSettingsForce(run.id);
+    this.linkVersion += 1;
+    hilog.info(0x0000, 'OpenSPHRoche', `build done nodes=${this.nodes.length} run=${run.handle}`);
+    return run.handle;
+  }
+
+  // 程序化搭一个最小可运行图（IC → SPH 运行），返回运行节点的 handle
+  private buildRunnableGraph(): number {
+    let ic: number = -1;
+    let sph: number = -1;
+    try {
+      ic = Number(ark.createNode('create monolithic body'));
+      sph = Number(ark.createNode('SPH run'));
+    } catch (e) {
+      return -1;
+    }
+    if (ic < 0 || sph < 0) {
+      return -1;
+    }
+    interface SlotInfo {
+      name: string;
+      used: boolean;
+      connected: boolean;
+    }
+    try {
+      const slots: SlotInfo[] = JSON.parse(String(ark.nodeSlots(sph))) as SlotInfo[];
+      for (const slot of slots) {
+        if (!slot.used || slot.connected) {
+          continue;
+        }
+        interface OpResult {
+          ok: boolean;
+          error?: string;
+        }
+        const res: OpResult = JSON.parse(String(ark.connectNodes(ic, sph, slot.name))) as OpResult;
+        if (res.ok) {
+          break;
+        }
+      }
+    } catch (e) {
+      // 忽略
+    }
+    // 放进画布并选中运行节点
+    const baseX: number = 120 + (this.nodes.length % 4) * 40;
+    const baseY: number = 120 + (this.nodes.length % 5) * 40;
+    const nIc: GraphNode = new GraphNode(this.nextId, ic, 'create monolithic body',
+      this.nodeTitle('create monolithic body'), this.label('initial conditions'), baseX, baseY);
+    this.nextId += 1;
+    const nSph: GraphNode = new GraphNode(this.nextId, sph, 'SPH run',
+      this.nodeTitle('SPH run'), this.label('simulation'), baseX + 200, baseY + 120);
+    this.nextId += 1;
+    this.nodes = this.nodes.concat([nIc, nSph]);
+    const link: GraphLink = { id: this.nextId, from: nIc.id, to: nSph.id };
+    this.nextId += 1;
+    this.links = this.links.concat([link]);
+    this.selectedNode = nSph.id;
+    this.loadSettingsForce(nSph.id);
+    hilog.info(0x0000, 'OpenSPHBuild', `graph ic=${ic} sph=${sph} nodes=${this.nodes.length}`);
+    return sph;
+  }
+
+  private startSimExportVideo(): void {
+    let node: GraphNode | undefined = this.nodeById(this.selectedNode);
+    if (!node || node.handle < 0 || node.className !== 'SPH run') {
+      // 没有合适的运行节点：自动搭一个 IC → SPH 运行的图
+      const handle: number = this.buildRunnableGraph();
+      if (handle < 0) {
+        this.noticeService.warn('无法建图', '创建 IC / SPH 运行节点失败');
+        return;
+      }
+      node = this.nodeById(this.selectedNode);
+      if (!node) {
+        return;
+      }
+    }
+    const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    const dir: string = ctx.filesDir + '/videos';
+    try {
+      if (!fs.accessSync(dir)) {
+        fs.mkdirSync(dir);
+      }
+    } catch (e) {
+      // 已存在
+    }
+    const name: string = this.exportName.length > 0 ? this.exportName : 'opensph-sim';
+    const path: string = `${dir}/${name}.mp4`;
+    if (fs.accessSync(path)) {
+      try {
+        fs.unlinkSync(path);
+      } catch (e) {
+        // ignore
+      }
+    }
+    interface SimExportOptions {
+      width: number;
+      height: number;
+      fps: number;
+      frames: number;
+      bitrate: number;
+      duration: number;
+      path: string;
+    }
+    const opts: SimExportOptions = {
+      width: 480, height: 270, fps: 24, frames: 24,
+      bitrate: 2000000, duration: 2000, path: path
+    };
+    let res: string = '';
+    try {
+      res = String(ark.startSimExport(node.handle, JSON.stringify(opts)));
+    } catch (e) {
+      this.noticeService.error('启动失败', String(e));
+      return;
+    }
+    hilog.info(0x0000, 'OpenSPHSimExp', `start handle=${node.handle} -> ${res}`);
+    const parsed: string = res;
+    if (parsed.indexOf("\"ok\":true") < 0) {
+      this.noticeService.error('无法渲染模拟', res);
+      return;
+    }
+    this.noticeService.info('开始渲染模拟', '4K60 · 600 帧');
+    const timer: number = setInterval(() => {
+      interface SimExpStatus {
+        active: boolean;
+        rendered: number;
+        total: number;
+        failed: boolean;
+        error: string;
+      }
+      let st: SimExpStatus | null = null;
+      try {
+        st = JSON.parse(String(ark.simExportStatus())) as SimExpStatus;
+      } catch (e) {
+        clearInterval(timer);
+        return;
+      }
+      if (st === null) {
+        clearInterval(timer);
+        return;
+      }
+      this.exportStatusText = `模拟渲染 ${st.rendered} / ${st.total} 帧`;
+      this.exportProgress = st.total > 0 ? st.rendered / st.total : 0;
+      if (st.failed) {
+        hilog.error(0x0000, 'OpenSPHSimExp', `failed: ${st.error}`);
+        this.noticeService.error('模拟渲染失败', st.error);
+        clearInterval(timer);
+      } else if (!st.active) {
+        hilog.info(0x0000, 'OpenSPHSimExp', `done ${st.rendered} frames`);
+        this.noticeService.success('模拟渲染完成', `${st.rendered} 帧`);
+        clearInterval(timer);
+      }
+    }, 700);
+  }
+
   private applyExportPreset(id: number): void {
     if (id === 0) {
       // 快速预览片：720p 横屏 / 24fps / 3 秒 / 快速画质
@@ -930,6 +1207,124 @@ struct ArkMain {
     }
     this.exportPreset = id;
     hilog.info(0x0000, 'OpenSPHExport', `preset=${id} res=${this.exportResolution} fps=${this.exportFps} frames=${this.exportFrames} quality=${this.exportQuality}`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 程序化等距圆柱贴图（equirectangular）：0=无纹理 1=类地球 2=类月球
+  // 说明：这里用程序化噪声而不是 NASA 影像，好处是体积为零、可复现、无版权问题；
+  // 观感上提供了大陆/海洋/极冠/月海/环形山等可辨识特征。
+  // ---------------------------------------------------------------------------
+  @State private textureKind: number = 2;
+  private noise2(x: number, y: number): number {
+    return Math.sin(x * 12.9898 + y * 78.233) * 43758.5453 % 1;
+  }
+  private fbm(x: number, y: number, oct: number): number {
+    let sum: number = 0;
+    let amp: number = 0.5;
+    let fx: number = x;
+    let fy: number = y;
+    for (let i = 0; i < oct; i++) {
+      const n: number = Math.sin(fx * 1.7 + fy * 2.3) * Math.cos(fx * 2.9 - fy * 1.1)
+        + 0.5 * Math.sin(fx * 5.3 + 0.7) * Math.cos(fy * 4.1 + 1.3);
+      sum += amp * (0.5 + 0.25 * n);
+      fx *= 2.0;
+      fy *= 2.0;
+      amp *= 0.5;
+    }
+    return sum;
+  }
+
+  private uploadTexture(kind: number): void {
+    try {
+      const W: number = 1024;
+      const H: number = 512;
+      if (kind === 0) {
+        const res0: string = String(ark.setTexture(0, 0, new Uint8ClampedArray(0).buffer as ArrayBuffer));
+        this.textureName = '无（按半径着色）';
+        hilog.info(0x0000, 'OpenSPHTex', `cleared -> ${res0}`);
+        return;
+      }
+      const buf: Uint8ClampedArray = new Uint8ClampedArray(W * H * 4);
+      // 月球环形山：预生成若干圆，供采样时叠加
+      const craters: number[] = [];
+      let seed: number = 12345;
+      const rnd = (): number => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+      };
+      for (let i = 0; i < 90; i++) {
+        craters.push(rnd());          // cx (0..1)
+        craters.push(rnd());          // cy (0..1)
+        craters.push(0.004 + rnd() * 0.03);  // 半径（UV 归一化）
+        craters.push(0.5 + rnd() * 0.5);     // 强度
+      }
+      for (let y = 0; y < H; y++) {
+        const v: number = y / H;
+        const lat: number = (0.5 - v) * Math.PI;
+        for (let x = 0; x < W; x++) {
+          const u: number = x / W;
+          const lon: number = u * Math.PI * 2;
+          const o: number = (y * W + x) * 4;
+          if (kind === 1) {
+            // 类地球：海洋 + 大陆 + 极冠 + 云
+            const n: number = this.fbm(Math.cos(lon) * 2.2 + 5, Math.sin(lon) * 2.2 + Math.abs(lat) * 1.5, 4);
+            const land: boolean = n > 0.52;
+            const ice: boolean = Math.abs(lat) > 1.22 - 0.12 * n;
+            const cloud: number = this.fbm(u * 9 + 11, v * 9 + 3, 3);
+            if (ice) {
+              buf[o] = 236; buf[o + 1] = 242; buf[o + 2] = 248;
+            } else if (land) {
+              const g: number = Math.min(1, Math.max(0, (n - 0.52) * 4));
+              buf[o] = 96 + 60 * g; buf[o + 1] = 116 + 50 * g; buf[o + 2] = 62 + 30 * g;
+            } else {
+              const d: number = 0.45 + 0.55 * Math.cos(lat);
+              buf[o] = 18 + 26 * d; buf[o + 1] = 58 + 46 * d; buf[o + 2] = 128 + 74 * d;
+            }
+            if (cloud > 0.62) {
+              const c: number = Math.min(1, (cloud - 0.62) * 5) * 0.75;
+              buf[o] = buf[o] * (1 - c) + 245 * c;
+              buf[o + 1] = buf[o + 1] * (1 - c) + 248 * c;
+              buf[o + 2] = buf[o + 2] * (1 - c) + 252 * c;
+            }
+          } else {
+            // 类月球：灰色基底 + 月海 + 环形山
+            const base: number = this.fbm(u * 6 + 21, v * 6 + 7, 4);
+            let g: number = 118 + 58 * (base - 0.5) * 2;
+            // 月海（大块暗区）
+            const maria: number = this.fbm(u * 2.4 + 3, v * 2.4 + 13, 3);
+            if (maria > 0.56) {
+              g -= 34;
+            }
+            // 环形山：中心暗、边缘亮
+            for (let ci = 0; ci + 3 < craters.length; ci += 4) {
+              const dx: number = Math.min(Math.abs(u - craters[ci]), 1 - Math.abs(u - craters[ci]));
+              const dy: number = v - craters[ci + 1];
+              const d: number = Math.sqrt(dx * dx + dy * dy) / craters[ci + 2];
+              if (d < 1.0) {
+                const inten: number = craters[ci + 3];
+                if (d < 0.75) {
+                  g -= 26 * inten * (1 - d / 0.75);
+                } else {
+                  g += 30 * inten * (1 - (1 - d) / 0.25);
+                }
+              }
+            }
+            g = Math.max(28, Math.min(246, g));
+            buf[o] = g; buf[o + 1] = g * 0.99; buf[o + 2] = g * 0.95;
+          }
+          buf[o + 3] = 255;
+        }
+      }
+      const res: string = String(ark.setTexture(W, H, buf.buffer as ArrayBuffer));
+      this.textureName = kind === 1 ? `类地球 ${W}×${H}` : `类月球 ${W}×${H}`;
+      hilog.info(0x0000, 'OpenSPHTex', `kind=${kind} upload ${W}x${H} -> ${res}`);
+    } catch (e) {
+      const err = e as Error;
+      hilog.error(0x0000, 'OpenSPHTex', `upload failed: ${err.message ?? String(e)}`);
+    }
+    // 纹理变化后强制重渲染
+    this.lastPixKey = '';
+    this.refreshPixel(this.yaw, this.pitch, true);
   }
 
   private exportSize(): number[] {
@@ -2149,6 +2544,11 @@ struct ArkMain {
         });
         hilog.info(0x0000, 'OpenSPHPane', `menu wide-right -> leftW=${this.leftW} rightW=${this.rightW}`);
         this.savePaneWidths();
+      } else if (index === 8) {
+        // 纹理循环：类月球 → 类地球 → 无 → 类月球…
+        this.textureKind = (this.textureKind + 1) % 3;
+        this.uploadTexture(this.textureKind);
+        this.noticeService.info('纹理已切换', this.textureName);
       } else {
         this.getUIContext().animateTo({ duration: durMs(DUR_BASE), curve: Curve.EaseOut }, () => {
           this.leftW = 230;
@@ -2185,6 +2585,15 @@ struct ArkMain {
         this.selfTest();
       }
     } else if (name === '渲染') {
+      if (index === 3) {
+        // 若当前没有洛希极限场景，先构建它再渲染
+        if (this.nodes.length === 0) {
+          const h: number = this.buildRocheScenario();
+          hilog.info(0x0000, 'OpenSPHRoche', `scenario handle=${h}`);
+        }
+        this.startSimExportVideo();
+        return;
+      }
       if (index === 1) {
         this.exportMode = 1;
       } else {
@@ -2214,14 +2623,15 @@ struct ArkMain {
     if (name === '视图') {
       return ['节点图', '预览', this.autoRotate ? '停止自动旋转' : '自动旋转',
         '复位画布', this.reduceMotion ? '恢复动效' : '减少动效',
-        '加宽左栏', '加宽右栏', '复位面板宽度'];
+        '加宽左栏', '加宽右栏', '复位面板宽度',
+        `纹理：${this.textureKind === 0 ? '无' : (this.textureKind === 1 ? '类地球' : '类月球')}`];
     }
     if (name === '模拟') {
       return ['开始运行', this.simPaused ? '继续' : '暂停', '停止',
         this.simRecording ? '停止录制' : '录制过程', '自检（IC+模拟）'];
     }
     if (name === '渲染') {
-      return ['导出视频…', '录制预览', '以 4K / 3 秒导出'];
+      return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）'];
     }
     return ['自检', '关于'];
   }
@@ -2884,6 +3294,14 @@ struct ArkMain {
   @Builder
   previewPane() {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 优先显示 C++ 光栅化结果（含球面纹理）；PixelMap 为空时回退 Canvas
+      if (this.previewPix !== null) {
+        Image(this.previewPix)
+          .width('100%')
+          .height('100%')
+          .objectFit(ImageFit.Contain)
+          .interpolation(ImageInterpolation.Medium)
+      }
       Canvas(this.previewCtx)
         .width('100%')
         .height('100%')
