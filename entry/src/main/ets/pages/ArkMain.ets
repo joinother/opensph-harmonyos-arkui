@@ -1028,6 +1028,86 @@ struct ArkMain {
     this.selectedNode = run.id;
     this.loadSettingsForce(run.id);
     this.linkVersion += 1;
+
+    // ---- 秒级诊断：回读设置是否真的写进去了 ----
+    const dumpKeys = (tag: string, h: number, keys: string[]): void => {  // keys 为设置键名
+      try {
+        const cats: SettingCategory[] = JSON.parse(String(ark.nodeSettings(h))) as SettingCategory[];
+        for (const cat of cats) {
+          for (const e of cat.entries) {
+            if (keys.indexOf(e.key) >= 0) {
+              hilog.info(0x0000, 'OpenSPHDiag', `${tag} ${e.key} = ${JSON.stringify(e.value)}`);
+            }
+          }
+        }
+      } catch (err) {
+        hilog.warn(0x0000, 'OpenSPHDiag', `${tag} dump failed`);
+      }
+    };
+    // 格式实验：逐次写入并回读，找出能真正生效的格式
+    const readOne = (h: number, key: string): string => {
+      try {
+        const cats: SettingCategory[] = JSON.parse(String(ark.nodeSettings(h))) as SettingCategory[];
+        for (const cat of cats) {
+          for (const e of cat.entries) {
+            if (e.key === key) {
+              return JSON.stringify(e.value);
+            }
+          }
+        }
+      } catch (e) {
+        return 'ERR';
+      }
+      return 'MISSING';
+    };
+    const trySet = (tag: string, h: number, key: string, val: string, tp: string): void => {
+      let ok: boolean = false;
+      try {
+        ok = Boolean(ark.setNodeSetting(h, key, val, tp));
+      } catch (e) {
+        hilog.warn(0x0000, 'OpenSPHDiag', `${tag} threw`);
+      }
+      hilog.info(0x0000, 'OpenSPHDiag', `${tag} set(${val},${tp}) -> ok=${ok} readback=${readOne(h, key)}`);
+    };
+    trySet('A', earth.handle, 'body.radius', '12742', 'float');
+    trySet('B', earth.handle, 'body.radius', '12742.0', 'float');
+    trySet('C', earth.handle, 'body.radius', '12742000', 'float');
+    trySet('D', earth.handle, 'particles.count', '1200', 'int');
+    trySet('E', shift.handle, 'offset', '0,33129,0', 'vector');
+    trySet('F', shift.handle, 'offset', '0 33129 0', 'vector');
+    dumpKeys('earth', earth.handle, ['body.radius', 'particles.count']);
+    dumpKeys('moon', moon.handle, ['body.radius', 'rheology.damage']);
+    dumpKeys('shift', shift.handle, ['offset', 'velocity_offset']);
+    dumpKeys('join', join.handle, ['offset', 'com', 'unique_flags']);
+    interface SlotDiag {
+      name: string;
+      used: boolean;
+      connected: boolean;
+      provider?: string;
+    }
+    interface Probe {
+      tag: string;
+      h: number;
+    }
+    const probes: Probe[] = [];
+    const p1: Probe = { tag: 'kepler', h: kepler.handle };
+    const p2: Probe = { tag: 'join', h: join.handle };
+    const p3: Probe = { tag: 'run', h: run.handle };
+    probes.push(p1);
+    probes.push(p2);
+    probes.push(p3);
+    for (const probe of probes) {
+      try {
+        const slots: SlotDiag[] = JSON.parse(String(ark.nodeSlots(probe.h))) as SlotDiag[];
+        const desc: string[] = [];
+        for (const sl of slots) {
+          desc.push(`${sl.name}:used=${sl.used},conn=${sl.connected}`);
+        }
+        hilog.info(0x0000, 'OpenSPHDiag', `${probe.tag} slots ${desc.join(' | ')}`);
+      } catch (err) {
+        hilog.warn(0x0000, 'OpenSPHDiag', `${probe.tag} slots failed`);
+      }
+    }
     hilog.info(0x0000, 'OpenSPHRoche', `build done nodes=${this.nodes.length} run=${run.handle}`);
     return run.handle;
   }
@@ -1088,6 +1168,34 @@ struct ArkMain {
   }
 
   private startSimExportVideo(): void {
+    // 优先走 C++ 原生预设（绕开「按字符串键写设置」不可靠的问题）
+    if (this.nodes.length === 0) {
+      let runHandle: number = -1;
+      try {
+        interface PresetRes {
+          ok: boolean;
+          run?: number;
+          error?: string;
+        }
+        const res: PresetRes = JSON.parse(String(ark.buildRochePreset())) as PresetRes;
+        if (res.ok && res.run !== undefined) {
+          runHandle = res.run;
+          hilog.info(0x0000, 'OpenSPHRoche', `native preset ok run=${runHandle}`);
+        } else {
+          hilog.warn(0x0000, 'OpenSPHRoche', `native preset failed: ${res.error ?? 'unknown'}`);
+        }
+      } catch (e) {
+        hilog.warn(0x0000, 'OpenSPHRoche', `native preset threw: ${String(e)}`);
+      }
+      if (runHandle >= 0) {
+        const n: GraphNode = new GraphNode(this.nextId, runHandle, 'SPH run',
+          this.nodeTitle('SPH run'), this.label('simulation'), 400, 200);
+        this.nextId += 1;
+        this.nodes = this.nodes.concat([n]);
+        this.selectedNode = n.id;
+        this.linkVersion += 1;
+      }
+    }
     let node: GraphNode | undefined = this.nodeById(this.selectedNode);
     if (!node || node.handle < 0 || node.className !== 'SPH run') {
       // 没有合适的运行节点：自动搭一个 IC → SPH 运行的图
@@ -1129,8 +1237,8 @@ struct ArkMain {
       path: string;
     }
     const opts: SimExportOptions = {
-      width: 480, height: 270, fps: 24, frames: 24,
-      bitrate: 2000000, duration: 2000, path: path
+      width: 3840, height: 2160, fps: 60, frames: 600,
+      bitrate: 40000000, duration: 2500, path: path
     };
     let res: string = '';
     try {
@@ -2586,11 +2694,7 @@ struct ArkMain {
       }
     } else if (name === '渲染') {
       if (index === 3) {
-        // 若当前没有洛希极限场景，先构建它再渲染
-        if (this.nodes.length === 0) {
-          const h: number = this.buildRocheScenario();
-          hilog.info(0x0000, 'OpenSPHRoche', `scenario handle=${h}`);
-        }
+        // 直接用 C++ 原生预设构建场景（不再经过 ArkTS 拼字符串键）
         this.startSimExportVideo();
         return;
       }

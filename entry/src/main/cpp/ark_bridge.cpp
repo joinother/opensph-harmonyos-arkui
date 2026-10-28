@@ -161,7 +161,7 @@ static void splatPoints(const std::vector<float>& pts,
     if (radius <= 0) {
         radius = 1;
     }
-    const double scale = double(std::min(W, H)) * 0.42 / radius;
+    const double scale = double(std::min(W, H)) * 0.36 / radius;
     const double ca = std::cos(yaw), sa = std::sin(yaw);
     const double ct = std::cos(pitch), st = std::sin(pitch);
     // 光照方向（视觉上方偏右前）
@@ -633,20 +633,36 @@ private:
     const String& rawValue;
     const String& valueType;
     bool& changed;
+    int& visited;
+    bool& matched;
 
 public:
-    SetValueProc(const String& targetKey, const String& rawValue, const String& valueType, bool& changed)
+    SetValueProc(const String& targetKey, const String& rawValue, const String& valueType, bool& changed,
+        int& visited, bool& matched)
         : targetKey(targetKey)
         , rawValue(rawValue)
         , valueType(valueType)
-        , changed(changed) {}
+        , changed(changed)
+        , visited(visited)
+        , matched(matched) {}
 
     virtual void onCategory(const String&) const override {}
 
+    mutable std::vector<std::string> sample;
+
     virtual void onEntry(const String& key, IVirtualEntry& entry) const override {
-        if (changed || key != targetKey) {
+        visited += 1;
+        if (sample.size() < 16) {
+            sample.push_back(key.toUtf8().cstr());
+        }
+        if (changed) {
             return;
         }
+        // 仅精确匹配：后缀匹配曾命中错误条目并触发内核断言杀进程，已回滚
+        if (key != targetKey) {
+            return;
+        }
+        matched = true;
         // 类型必须先匹配：直接调用 entry.set() 传入错误类型会触发内核断言并杀掉进程。
         const IVirtualEntry::Type entryType = entry.getType();
         const bool typeOk = (valueType == "bool" && entryType == IVirtualEntry::Type::BOOL) ||
@@ -657,15 +673,24 @@ public:
                             (valueType == "vector" && entryType == IVirtualEntry::Type::VECTOR) ||
                             (valueType == "interval" && entryType == IVirtualEntry::Type::INTERVAL);
         if (!typeOk) {
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0x0000, "OpenSPHSetEntry",
+                "type mismatch key=%{public}s want=%{public}s entryType=%{public}d",
+                key.toUtf8().cstr(), valueType.toUtf8().cstr(), int(entryType));
             return;
         }
+        const bool entryEnabled = entry.enabled();
         try {
             if (valueType == "bool") {
                 changed = entry.set(IVirtualEntry::Value(rawValue == "true"));
             } else if (valueType == "int") {
                 changed = entry.set(IVirtualEntry::Value(std::atoi(rawValue.toUtf8().cstr())));
             } else if (valueType == "float") {
-                changed = entry.set(IVirtualEntry::Value(Float(std::atof(rawValue.toUtf8().cstr()))));
+                // 条目实际是 INT 时必须传 int，否则 Variant 类型不符会触发内核断言直接杀进程
+                if (entryType == IVirtualEntry::Type::INT) {
+                    changed = entry.set(IVirtualEntry::Value(int(std::atoi(rawValue.toUtf8().cstr()))));
+                } else {
+                    changed = entry.set(IVirtualEntry::Value(Float(std::atof(rawValue.toUtf8().cstr()))));
+                }
             } else if (valueType == "vector") {
                 Float xyz[3] = {0.f, 0.f, 0.f};
                 const char* text = rawValue.toUtf8().cstr();
@@ -1480,6 +1505,78 @@ napi_value jobCatalog(napi_env env, napi_callback_info) {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// 原生洛希极限场景构造器
+// 为什么不走 ArkTS + setNodeSetting：桥接层「按字符串键写设置」对数值型不可靠
+// （float/int/vector 全部 matched=0，强行后缀匹配会命中错误条目并触发内核断言），
+// 因此这里直接用 makeNode<> 建图并设置参数，绕开字符串键这一层。
+// ---------------------------------------------------------------------------
+napi_value buildRochePreset(napi_env env, napi_callback_info) {
+    registerCoreJobs();
+    try {
+        // 地球：放大 2 倍以降低数密度（提速），半径 12742 km
+        SharedPtr<JobNode> earth = makeNode<MonolithicBodyIc>(String::fromUtf8("earth"));
+        earth->getSettings().set(BodySettingsId::BODY_RADIUS, Float(1.2742e7f));
+
+        // 月球：半径 3474 km + 标量 Grady-Kipp 碎裂 + Drucker-Prager 屈服
+        SharedPtr<JobNode> moon = makeNode<MonolithicBodyIc>(String::fromUtf8("moon"));
+        moon->getSettings().set(BodySettingsId::BODY_RADIUS, Float(3.474e6f));
+        moon->getSettings().set(BodySettingsId::RHEOLOGY_DAMAGE,
+            EnumWrapper(FractureEnum::SCALAR_GRADY_KIPP));
+        moon->getSettings().set(BodySettingsId::RHEOLOGY_YIELDING,
+            EnumWrapper(YieldingEnum::DRUCKER_PRAGER));
+
+        // 把月球平移到轨道半径 3.31e7 m
+        SharedPtr<JobNode> shift = makeNode<TransformParticlesJob>(String::fromUtf8("shift moon"));
+        shift->getSettings().set("offset", Vector(0._f, 2.8e7_f, 0._f));
+
+        // 以地球为引力源，给月球圆轨道速度
+        SharedPtr<JobNode> kepler = makeNode<KeplerianVelocityIc>(String::fromUtf8("kepler"));
+
+        // 合并：禁止质心归零，粒子标记去重
+        SharedPtr<JobNode> join = makeNode<JoinParticlesJob>(String::fromUtf8("join"));
+        join->getSettings().set("com", false);
+        join->getSettings().set("unique_flags", true);
+
+        // 模拟：Barnes-Hut 自引力 + 100 s 最大时间步
+        SharedPtr<JobNode> run = makeNode<SphJob>(String::fromUtf8("SPH run"), EMPTY_SETTINGS);
+        run->getSettings().set(RunSettingsId::GRAVITY_SOLVER, EnumWrapper(GravityEnum::BARNES_HUT));
+        run->getSettings().set(RunSettingsId::TIMESTEPPING_MAX_TIMESTEP, 100._f);
+
+        // 连线（provider -> consumer, slot）
+        moon->connect(shift, String::fromUtf8("particles"));
+        earth->connect(kepler, String::fromUtf8("gravity source"));
+        shift->connect(kepler, String::fromUtf8("orbiting"));
+        earth->connect(join, String::fromUtf8("particles A"));
+        kepler->connect(join, String::fromUtf8("particles B"));
+        join->connect(run, String::fromUtf8("particles"));
+
+        // 注册到句柄表，供 ArkTS 选中与导出
+        const int hEarth = nextNodeHandle++;
+        nodeRegistry().insert(std::make_pair(hEarth, earth));
+        const int hMoon = nextNodeHandle++;
+        nodeRegistry().insert(std::make_pair(hMoon, moon));
+        const int hShift = nextNodeHandle++;
+        nodeRegistry().insert(std::make_pair(hShift, shift));
+        const int hKepler = nextNodeHandle++;
+        nodeRegistry().insert(std::make_pair(hKepler, kepler));
+        const int hJoin = nextNodeHandle++;
+        nodeRegistry().insert(std::make_pair(hJoin, join));
+        const int hRun = nextNodeHandle++;
+        nodeRegistry().insert(std::make_pair(hRun, run));
+
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHRoche",
+            "native preset built run=%{public}d (earth=%{public}d moon=%{public}d)",
+            hRun, hEarth, hMoon);
+        return makeString(env, "{\"ok\":true,\"run\":" + std::to_string(hRun)
+            + ",\"earth\":" + std::to_string(hEarth) + ",\"moon\":" + std::to_string(hMoon) + "}");
+    } catch (const std::exception& e) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, 0x0000, "OpenSPHRoche", "preset failed: %{public}s", e.what());
+        return makeString(env, "{\"ok\":false,\"error\":\"" + jsonEscape(String::fromUtf8(e.what())) + "\"}");
+    }
+}
+
 napi_value createNode(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1];
@@ -1563,12 +1660,29 @@ napi_value setNodeSetting(napi_env env, napi_callback_info info) {
     napi_get_value_string_utf8(env, argv[3], valueType, sizeof(valueType), &len);
 
     bool changed = false;
+    int visited = 0;
+    bool matched = false;
     const auto it = nodeRegistry().find(handle);
     if (it != nodeRegistry().end()) {
         VirtualSettings settings = it->second->getSettings();
-        SetValueProc proc(String::fromUtf8(key), String::fromUtf8(value), String::fromUtf8(valueType), changed);
+        SetValueProc proc(String::fromUtf8(key), String::fromUtf8(value), String::fromUtf8(valueType),
+            changed, visited, matched);
         settings.enumerate(proc);
+        if (!matched) {
+            std::string joined;
+            for (const std::string& k : proc.sample) {
+                if (!joined.empty()) {
+                    joined += ",";
+                }
+                joined += k;
+            }
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHSetDbg",
+                "first keys: %{public}s", joined.c_str());
+        }
     }
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHSetDbg",
+        "handle=%{public}d key=%{public}s type=%{public}s visited=%{public}d matched=%{public}d changed=%{public}d",
+        handle, key, valueType, visited, int(matched), int(changed));
     napi_value result;
     napi_get_boolean(env, changed, &result);
     return result;
@@ -2558,6 +2672,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"version", nullptr, version, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"jobCatalog", nullptr, jobCatalog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"createNode", nullptr, createNode, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"buildRochePreset", nullptr, buildRochePreset, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"nodeSettings", nullptr, nodeSettings, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setNodeSetting", nullptr, setNodeSetting, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"releaseNode", nullptr, releaseNode, nullptr, nullptr, nullptr, napi_default, nullptr},
