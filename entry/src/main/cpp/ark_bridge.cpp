@@ -52,13 +52,21 @@ using namespace Sph;
 // 球面纹理：ArkTS 侧把贴图解码成 RGBA 后传进来，这里按球面 UV 做双线性采样。
 // UV 约定：u = 0.5 + atan2(z, x)/2π，v = 0.5 - asin(y/r)/π（v 向上）。
 // ---------------------------------------------------------------------------
-// 双纹理槽：0 = 主天体（地球），1 = 次天体（月球）
-static std::vector<uint8_t> g_tex[2];
-static int g_texW[2] = { 0, 0 };
-static int g_texH[2] = { 0, 0 };
+// 纹理槽：每个天体可以有自己的贴图，最多 8 张
+static const int kMaxTex = 8;
+static std::vector<uint8_t> g_tex[kMaxTex];
+static int g_texW[kMaxTex] = { 0 };
+static int g_texH[kMaxTex] = { 0 };
+
+// 天体表：中心、半径、贴图槽。渲染时每颗粒子按最近天体决定用哪张贴图。
+struct BodyTex {
+    double cx, cy, cz, r;
+    int slot;
+};
+static std::vector<BodyTex> g_bodies;
 
 static void setTextureData(const int slot, const int w, const int h, const uint8_t* src) {
-    const int i = (slot >= 0 && slot < 2) ? slot : 0;
+    const int i = (slot >= 0 && slot < kMaxTex) ? slot : 0;
     if (w <= 0 || h <= 0 || src == nullptr) {
         g_tex[i].clear();
         g_texW[i] = g_texH[i] = 0;
@@ -72,7 +80,7 @@ static void setTextureData(const int slot, const int w, const int h, const uint8
 /// 双线性采样；返回 false 表示没有纹理
 static bool sampleTexture(const int slot, const double u, const double v,
     double& outR, double& outG, double& outB) {
-    const int si = (slot >= 0 && slot < 2) ? slot : 0;
+    const int si = (slot >= 0 && slot < kMaxTex) ? slot : 0;
     if (g_texW[si] <= 0 || g_texH[si] <= 0 || g_tex[si].empty()) {
         return false;
     }
@@ -93,9 +101,10 @@ static bool sampleTexture(const int slot, const double u, const double v,
     const int ya = ((y0 % texH) + texH) % texH;
     auto tex = [&](const int px, const int py, double& r, double& gg, double& b) {
         const size_t o = (size_t(py) * size_t(texW) + size_t(px)) * 4;
-        r = double(texBuf[o]) / 255.0;
+        // 上传链路实际按 BGRA 落位，这里交换 R/B 才能得到正确颜色
+        b = double(texBuf[o]) / 255.0;
         gg = double(texBuf[o + 1]) / 255.0;
-        b = double(texBuf[o + 2]) / 255.0;
+        r = double(texBuf[o + 2]) / 255.0;
     };
     double r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
     tex(xa, ya, r00, g00, b00);
@@ -172,7 +181,8 @@ static void splatPoints(const std::vector<float>& pts,
     struct Sample {
         float sx, sy, depth, rr;
         float bx, by, bz;   // 物体空间单位方向（用于球面 UV）
-        int grp;            // 所属天体（0/1）
+        int grp;            // 所属天体索引（对应 g_bodies）
+        int slot;           // 该天体使用的贴图槽
     };
     // 双天体分组：用最远点对确定分离轴，按中点为界把采样点分成两组（地球/月球）
     double axX = 0, axY = 0, axZ = 0, axP = 0;
@@ -226,6 +236,44 @@ static void splatPoints(const std::vector<float>& pts,
         }
     }
 
+    // 单天体判定：若两簇靠得太近（相距 < 1.05×(r0+r1)），说明其实是一个天体，
+    // 不能再按两簇算球心，否则球会被切成两半、右半法线错位导致颜色发白。
+    {
+        const double dx = gcx[1] - gcx[0];
+        const double dy = gcy[1] - gcy[0];
+        const double dz = gcz[1] - gcz[0];
+        const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (gcnt[0] == 0 || gcnt[1] == 0 || dist < 1.05 * (grd[0] + grd[1])) {
+            gcnt[0] = int(n);
+            gcnt[1] = 0;
+            gcx[0] = gcx[1] = 0.0;
+            gcy[0] = gcy[1] = 0.0;
+            gcz[0] = gcz[1] = 0.0;
+            // 用整团质心与最大半径
+            double sx = 0, sy = 0, sz = 0;
+            for (size_t k = 0; k < n; ++k) {
+                sx += pts[k * 3];
+                sy += pts[k * 3 + 1];
+                sz += pts[k * 3 + 2];
+            }
+            sx /= double(n);
+            sy /= double(n);
+            sz /= double(n);
+            double rmax = 0;
+            for (size_t k = 0; k < n; ++k) {
+                const double ax = pts[k * 3] - sx;
+                const double ay = pts[k * 3 + 1] - sy;
+                const double az = pts[k * 3 + 2] - sz;
+                rmax = std::max(rmax, std::sqrt(ax * ax + ay * ay + az * az));
+            }
+            gcx[0] = sx;
+            gcy[0] = sy;
+            gcz[0] = sz;
+            grd[0] = rmax;
+            grd[1] = rmax;
+        }
+    }
+
     std::vector<Sample> samples(n);
     for (size_t k = 0; k < n; ++k) {
         // 组号：与聚类一致的投影判据
@@ -237,8 +285,25 @@ static void splatPoints(const std::vector<float>& pts,
             grpAxis = (pts[k * 3] - cx0) * (axX - cx0) + (pts[k * 3 + 1] - cy0) * (axY - cy0)
                 + (pts[k * 3 + 2] - cz0) * (axZ - cz0);
         }
-        const int grp = grpAxis >= 0 ? 1 : 0;
+        int grp = gcnt[1] > 0 ? (grpAxis >= 0 ? 1 : 0) : 0;
+        int slot = grp == 1 ? 1 : 0;
+        if (!g_bodies.empty()) {
+            // 按「离哪个天体最近（用 r 归一化）」决定归属，支持任意天体数
+            double best = 1e300;
+            for (size_t bi = 0; bi < g_bodies.size(); ++bi) {
+                const double ddx = pts[k * 3] - g_bodies[bi].cx;
+                const double ddy = pts[k * 3 + 1] - g_bodies[bi].cy;
+                const double ddz = pts[k * 3 + 2] - g_bodies[bi].cz;
+                const double norm = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz) / std::max(1.0, g_bodies[bi].r);
+                if (norm < best) {
+                    best = norm;
+                    grp = int(bi);
+                    slot = g_bodies[bi].slot;
+                }
+            }
+        }
         samples[k].grp = grp;
+        samples[k].slot = slot;
         const double x0 = pts[k * 3] - cx, y0 = pts[k * 3 + 1] - cy, z0 = pts[k * 3 + 2] - cz;
         const double x1 = x0 * ca - y0 * sa;
         const double y1 = x0 * sa + y0 * ca;
@@ -273,6 +338,8 @@ static void splatPoints(const std::vector<float>& pts,
     // z-buffer：最近点胜出。加法混合会让「叠加次数」差异变成蜂窝条纹，
     // 最近点写法则直接取最外层粒子的颜色，条纹消失且物理上更合理。
     std::vector<float> zbuf(size_t(W) * size_t(H), -2.0f);
+    std::vector<uint8_t> gbuf(size_t(W) * size_t(H), 0xFF);   // 每像素所属天体索引
+    std::vector<uint8_t> sbuf(size_t(W) * size_t(H), 0);      // 每像素使用的贴图槽
 
     const float resBoost = std::min(2.2f, std::max(1.0f, float(std::min(W, H)) / 1080.0f));
     const float baseR = std::max(1.5f, float(std::min(W, H)) * 0.0042f) * resBoost * 1.55f
@@ -342,6 +409,8 @@ static void splatPoints(const std::vector<float>& pts,
                     continue;   // 被更近的粒子遮挡
                 }
                 zbuf[zi] = sm.depth;
+                gbuf[zi] = uint8_t(sm.grp);
+                sbuf[zi] = uint8_t(sm.slot);
                 // 最近点着色：整盘同色，不按到中心的距离提亮，
                 // 否则每个粒子都会变成一个可见的「泡泡」，表面出现蜂窝鼓包。
                 const double shade = 1.0;
@@ -362,6 +431,24 @@ static void splatPoints(const std::vector<float>& pts,
         const double cxPix = double(W) * 0.5;
         const double cyPix = double(H) * 0.5;
         const double rPix = scale * radius;
+        // 每个天体各自的屏幕中心与屏幕半径（按同一投影变换计算）
+        const int kMaxBody = 8;
+        double gsx[kMaxBody] = { cxPix, cxPix, cxPix, cxPix, cxPix, cxPix, cxPix, cxPix };
+        double gsy[kMaxBody] = { cyPix, cyPix, cyPix, cyPix, cyPix, cyPix, cyPix, cyPix };
+        double gsr[kMaxBody] = { rPix, rPix, rPix, rPix, rPix, rPix, rPix, rPix };
+        const int bodyCnt = g_bodies.empty() ? 2 : std::min<int>(kMaxBody, int(g_bodies.size()));
+        for (int g = 0; g < bodyCnt; ++g) {
+            const double wx = (g_bodies.empty() ? gcx[g] : g_bodies[g].cx) - cx;
+            const double wy = (g_bodies.empty() ? gcy[g] : g_bodies[g].cy) - cy;
+            const double wz = (g_bodies.empty() ? gcz[g] : g_bodies[g].cz) - cz;
+            const double x1g = wx * ca - wy * sa;
+            const double y1g = wx * sa + wy * ca;
+            const double y2g = y1g * ct - wz * st;
+            const double z2g = y1g * st + wz * ct;
+            gsx[g] = double(W) * 0.5 + x1g * scale;
+            gsy[g] = double(H) * 0.5 - z2g * scale;
+            gsr[g] = std::max(1.0, (g_bodies.empty() ? grd[g] : g_bodies[g].r) * scale);
+        }
         // 相机空间法线 → 物体空间（恢复纹理随天体旋转的正确 UV）
         auto camToBody = [&](double nx, double ny, double nz, double& bx, double& by, double& bz) {
             const double y1 = ny * ct + nz * st;
@@ -373,12 +460,14 @@ static void splatPoints(const std::vector<float>& pts,
         for (int py = 0; py < H; ++py) {
             for (int px = 0; px < W; ++px) {
                 const size_t zi = size_t(py) * size_t(W) + size_t(px);
-                if (zbuf[zi] <= -1.5f) {
+                if (zbuf[zi] <= -1.5f || gbuf[zi] == 0xFF) {
                     continue;
                 }
-                // 球面法线（对球/椭球精确）；轮廓外由深度梯度兜底
-                double nx = (double(px) + 0.5 - cxPix) / rPix;
-                double ny = (double(py) + 0.5 - cyPix) / rPix;
+                const int g = gbuf[zi];
+                const int slot = sbuf[zi];
+                // 球面法线（各自天体中心）；轮廓外由深度梯度兜底
+                double nx = (double(px) + 0.5 - gsx[g]) / gsr[g];
+                double ny = (double(py) + 0.5 - gsy[g]) / gsr[g];
                 const double r2 = nx * nx + ny * ny;
                 double nz;
                 if (r2 < 0.999) {
@@ -403,7 +492,10 @@ static void splatPoints(const std::vector<float>& pts,
                 const double uu = 0.5 + std::atan2(bz, bx) / (2.0 * 3.14159265358979);
                 const double vv = 0.5 - std::asin(std::max(-1.0, std::min(1.0, by))) / 3.14159265358979;
                 double tr = 0.75, tg = 0.75, tb = 0.72;
-                sampleTexture(0, uu, vv, tr, tg, tb);
+                // 按该天体自己的贴图槽采样
+                if (!sampleTexture(slot, uu, vv, tr, tg, tb)) {
+                    sampleTexture(0, uu, vv, tr, tg, tb);
+                }
                 const double diff = std::max(0.0, nx * lx + ny * ly + nz * lz);
                 double hx = lx, hy = ly, hz = lz + 1.0;
                 const double hn = std::sqrt(hx * hx + hy * hy + hz * hz);
@@ -1447,7 +1539,7 @@ napi_value setTexture(napi_env env, napi_callback_info info) {
         return makeString(env, "{\"ok\":false,\"error\":\"纹理尺寸不匹配\"}");
     }
     setTextureData(slot, w, h, static_cast<const uint8_t*>(data));
-    const int si = (slot >= 0 && slot < 2) ? slot : 0;
+    const int si = (slot >= 0 && slot < kMaxTex) ? slot : 0;
     return makeString(env, "{\"ok\":true,\"slot\":" + std::to_string(si)
         + ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h)
         + ",\"stored\":" + std::to_string(g_tex[si].size()) + "}");
@@ -1518,10 +1610,12 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
         // 地球：放大 2 倍以降低数密度（提速），半径 12742 km
         SharedPtr<JobNode> earth = makeNode<MonolithicBodyIc>(String::fromUtf8("earth"));
         earth->getSettings().set(BodySettingsId::BODY_RADIUS, Float(1.2742e7f));
+        earth->getSettings().set(BodySettingsId::PARTICLE_COUNT, int(40000));
 
         // 月球：半径 3474 km + 标量 Grady-Kipp 碎裂 + Drucker-Prager 屈服
         SharedPtr<JobNode> moon = makeNode<MonolithicBodyIc>(String::fromUtf8("moon"));
         moon->getSettings().set(BodySettingsId::BODY_RADIUS, Float(3.474e6f));
+        moon->getSettings().set(BodySettingsId::PARTICLE_COUNT, int(40000));
         moon->getSettings().set(BodySettingsId::RHEOLOGY_DAMAGE,
             EnumWrapper(FractureEnum::SCALAR_GRADY_KIPP));
         moon->getSettings().set(BodySettingsId::RHEOLOGY_YIELDING,
@@ -1529,7 +1623,7 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
 
         // 把月球平移到轨道半径 3.31e7 m
         SharedPtr<JobNode> shift = makeNode<TransformParticlesJob>(String::fromUtf8("shift moon"));
-        shift->getSettings().set("offset", Vector(0._f, 2.8e7_f, 0._f));
+        shift->getSettings().set("offset", Vector(0._f, 2.29e7_f, 0._f));   // 1.8 R⊕
 
         // 以地球为引力源，给月球圆轨道速度
         SharedPtr<JobNode> kepler = makeNode<KeplerianVelocityIc>(String::fromUtf8("kepler"));
@@ -1542,7 +1636,7 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
         // 模拟：Barnes-Hut 自引力 + 100 s 最大时间步
         SharedPtr<JobNode> run = makeNode<SphJob>(String::fromUtf8("SPH run"), EMPTY_SETTINGS);
         run->getSettings().set(RunSettingsId::GRAVITY_SOLVER, EnumWrapper(GravityEnum::BARNES_HUT));
-        run->getSettings().set(RunSettingsId::TIMESTEPPING_MAX_TIMESTEP, 100._f);
+        run->getSettings().set(RunSettingsId::TIMESTEPPING_MAX_TIMESTEP, 10._f);
 
         // 连线（provider -> consumer, slot）
         moon->connect(shift, String::fromUtf8("particles"));
@@ -1569,8 +1663,19 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHRoche",
             "native preset built run=%{public}d (earth=%{public}d moon=%{public}d)",
             hRun, hEarth, hMoon);
+        // nodes 顺序：0=地球 1=月球 2=平移 3=开普勒 4=合并 5=运行
+        // links 用下标表示，ArkTS 侧据此在画布上画线（否则 UI 显示「连线 0」）
         return makeString(env, "{\"ok\":true,\"run\":" + std::to_string(hRun)
-            + ",\"earth\":" + std::to_string(hEarth) + ",\"moon\":" + std::to_string(hMoon) + "}");
+            + ",\"handles\":[" + std::to_string(hEarth) + "," + std::to_string(hMoon) + ","
+            + std::to_string(hShift) + "," + std::to_string(hKepler) + "," + std::to_string(hJoin) + ","
+            + std::to_string(hRun) + "]"
+            + ",\"classes\":[\"create monolithic body\",\"create monolithic body\",\"transform\","
+            + "\"set Keplerian velocity\",\"join\",\"SPH run\"]"
+            + ",\"links\":[[1,2],[0,3],[2,3],[0,4],[3,4],[4,5]]"
+            + ",\"bodies\":[{\"handle\":" + std::to_string(hEarth) + ",\"cx\":0,\"cy\":0,\"cz\":0"
+            + ",\"r\":" + std::to_string(1.2742e7f) + ",\"slot\":0}"
+            + ",{\"handle\":" + std::to_string(hMoon) + ",\"cx\":0,\"cy\":" + std::to_string(2.29e7f)
+            + ",\"cz\":0,\"r\":" + std::to_string(3.474e6f) + ",\"slot\":1}]}");
     } catch (const std::exception& e) {
         OH_LOG_Print(LOG_APP, LOG_ERROR, 0x0000, "OpenSPHRoche", "preset failed: %{public}s", e.what());
         return makeString(env, "{\"ok\":false,\"error\":\"" + jsonEscape(String::fromUtf8(e.what())) + "\"}");
@@ -1937,6 +2042,121 @@ napi_value loadSession(napi_env env, napi_callback_info info) {
     } catch (const std::exception& e) {
         return makeString(env, "{\"ok\":false,\"error\":\"" + jsonEscape(String::fromUtf8(e.what())) + "\"}");
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// 导出内核作业图的完整快照（节点 + 有向连接），供 ArkTS 把画布与内核对齐。
+// 这样不论是谁在内核里建图（预设、脚本、远程接口），画布都能自动反映出来。
+// ---------------------------------------------------------------------------
+napi_value setBodyTextures(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char text[2048] = {0};
+    size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], text, sizeof(text), &len);
+    const std::string json(text, len);
+    g_bodies.clear();
+    // 极小 JSON 解析：匹配 {"cx":..,"cy":..,"cz":..,"r":..,"slot":..}
+    auto readNum = [&json](const size_t from, const char* key, double& out) -> bool {
+        const std::string k = std::string("\"") + key + "\"";
+        const size_t p = json.find(k, from);
+        if (p == std::string::npos) {
+            return false;
+        }
+        const size_t colon = json.find(':', p);
+        if (colon == std::string::npos) {
+            return false;
+        }
+        out = std::atof(json.c_str() + colon + 1);
+        return true;
+    };
+    size_t pos = 0;
+    while (true) {
+        const size_t brace = json.find('{', pos);
+        if (brace == std::string::npos) {
+            break;
+        }
+        BodyTex b{ 0, 0, 0, 1, 0 };
+        double slotD = 0;
+        if (!readNum(brace, "cx", b.cx) || !readNum(brace, "cy", b.cy) || !readNum(brace, "cz", b.cz)
+            || !readNum(brace, "r", b.r)) {
+            break;
+        }
+        if (readNum(brace, "slot", slotD)) {
+            b.slot = int(slotD);
+        }
+        g_bodies.push_back(b);
+        const size_t close = json.find('}', brace);
+        if (close == std::string::npos) {
+            break;
+        }
+        pos = close + 1;
+        if (g_bodies.size() >= 8) {
+            break;
+        }
+    }
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHBody",
+        "setBodyTextures count=%{public}zu", g_bodies.size());
+    return makeString(env, "{\"ok\":true,\"count\":" + std::to_string(g_bodies.size()) + "}");
+}
+
+napi_value listJobGraph(napi_env env, napi_callback_info) {
+    std::string json = "{\"nodes\":[";
+    bool firstNode = true;
+    // handle -> 节点类名（用于画布标题）
+    for (const auto& kv : nodeRegistry()) {
+        SharedPtr<JobNode> node = kv.second;
+        if (!node) {
+            continue;
+        }
+        if (!firstNode) {
+            json += ",";
+        }
+        firstNode = false;
+        const char* cls = "job";
+        if (node->getJob()) {
+            cls = node->getJob()->className().toUtf8().cstr();
+        }
+        json += "{\"handle\":" + std::to_string(kv.first)
+            + ",\"class\":\"" + jsonEscape(String::fromUtf8(cls)) + "\"}";
+    }
+    json += "],\"links\":[";
+    bool firstLink = true;
+    for (const auto& kv : nodeRegistry()) {
+        SharedPtr<JobNode> node = kv.second;
+        if (!node) {
+            continue;
+        }
+        const Size cnt = node->getSlotCnt();
+        for (Size i = 0; i < cnt; ++i) {
+            const SlotData slot = node->getSlot(i);
+            if (!slot.provider) {
+                continue;
+            }
+            // 找到 provider 节点对应的 handle
+            int providerHandle = -1;
+            for (const auto& other : nodeRegistry()) {
+                if (other.second.get() == slot.provider.get()) {
+                    providerHandle = other.first;
+                    break;
+                }
+            }
+            if (providerHandle < 0) {
+                continue;
+            }
+            if (!firstLink) {
+                json += ",";
+            }
+            firstLink = false;
+            json += "{\"from\":" + std::to_string(providerHandle)
+                + ",\"to\":" + std::to_string(kv.first)
+                + ",\"slot\":\"" + jsonEscape(slot.name) + "\"}";
+        }
+    }
+    json += "]}";
+    return makeString(env, json);
 }
 
 napi_value nodeSlots(napi_env env, napi_callback_info info) {
@@ -2691,6 +2911,8 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"saveSession", nullptr, saveSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"loadSession", nullptr, loadSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"nodeSlots", nullptr, nodeSlots, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"listJobGraph", nullptr, listJobGraph, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setBodyTextures", nullptr, setBodyTextures, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"connectNodes", nullptr, connectNodes, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"runSimulation", nullptr, runSimulation, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"simulationStatus", nullptr, simulationStatus, nullptr, nullptr, nullptr, napi_default, nullptr},

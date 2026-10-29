@@ -13,6 +13,7 @@ import common from '@ohos.app.ability.common';
 import fs from '@ohos.file.fs';
 import image from '@ohos.multimedia.image';
 import picker from '@ohos.file.picker';
+import { RemoteServer, RemoteReply, RemoteRequest } from '../common/RemoteServer';
 import { SystemNotifier } from '../common/SystemNotifier';
 
 interface JobEntry {
@@ -312,6 +313,16 @@ struct ArkMain {
   @State private pendingValue: string = '';
   private pendingByKey: Map<string, string> = new Map<string, string>();
   @State private textureName: string = '';
+  private pendingSimPath: string = '';
+  private remote: RemoteServer = new RemoteServer();
+  @State private remoteVisible: boolean = false;
+  @State private remoteEnabled: boolean = false;
+  @State private remotePort: number = 8099;
+  @State private remotePwdDraft: string = '';
+  @State private remoteWan: boolean = false;
+  @State private remoteAddrText: string = '未启动';
+  private bodySlots: Map<number, number> = new Map<number, number>();
+  private bodyInfo: string = '';   // 传给渲染器的天体表 JSON
   private pendingTimers: Map<string, number> = new Map<string, number>();
   @State private toasts: AppNotice[] = [];
   @State private history: AppNotice[] = [];
@@ -1027,7 +1038,7 @@ struct ArkMain {
 
     this.selectedNode = run.id;
     this.loadSettingsForce(run.id);
-    this.linkVersion += 1;
+    this.syncCanvasFromKernel();
 
     // ---- 秒级诊断：回读设置是否真的写进去了 ----
     const dumpKeys = (tag: string, h: number, keys: string[]): void => {  // keys 为设置键名
@@ -1167,33 +1178,161 @@ struct ArkMain {
     return sph;
   }
 
+  // 把画布与内核作业图对齐：不论谁在内核里建图（预设/脚本/远程接口），
+  // 这里都能生成对应的节点与连线，避免出现「内核有图、画布空」的情况。
+  private syncCanvasFromKernel(): void {
+    interface KernelNode {
+      handle: number;
+      class: string;
+    }
+    interface KernelLink {
+      from: number;
+      to: number;
+      slot: string;
+    }
+    interface KernelGraph {
+      nodes: KernelNode[];
+      links: KernelLink[];
+    }
+    let g: KernelGraph | null = null;
+    try {
+      g = JSON.parse(String(ark.listJobGraph())) as KernelGraph;
+    } catch (e) {
+      hilog.warn(0x0000, 'OpenSPHSync', 'listJobGraph failed');
+      return;
+    }
+    if (g === null) {
+      return;
+    }
+    // 已有句柄 → 画布节点 id 的映射
+    const idByHandle: Map<number, number> = new Map<number, number>();
+    for (const n of this.nodes) {
+      idByHandle.set(n.handle, n.id);
+    }
+    // 1) 补齐缺失节点（按列错开摆放）
+    const added: GraphNode[] = [];
+    for (const kn of g.nodes) {
+      if (idByHandle.has(kn.handle)) {
+        continue;
+      }
+      const idx: number = added.length + this.nodes.length;
+      const node: GraphNode = new GraphNode(this.nextId, kn.handle, kn.class,
+        this.nodeTitle(kn.class), this.label(kn.class),
+        60 + (idx % 5) * 190, 90 + (Math.floor(idx / 5) % 3) * 130);
+      this.nextId += 1;
+      added.push(node);
+      idByHandle.set(kn.handle, node.id);
+    }
+    if (added.length > 0) {
+      this.nodes = this.nodes.concat(added);
+    }
+    // 2) 补齐缺失连线
+    const existing: Set<string> = new Set<string>();
+    for (const l of this.links) {
+      existing.add(`${l.from}>${l.to}`);
+    }
+    const newLinks: GraphLink[] = [];
+    for (const kl of g.links) {
+      const fromId: number | undefined = idByHandle.get(kl.from);
+      const toId: number | undefined = idByHandle.get(kl.to);
+      if (fromId === undefined || toId === undefined) {
+        continue;
+      }
+      const key: string = `${fromId}>${toId}`;
+      if (existing.has(key)) {
+        continue;
+      }
+      existing.add(key);
+      const link: GraphLink = { id: this.nextId, from: fromId, to: toId };
+      this.nextId += 1;
+      newLinks.push(link);
+    }
+    if (newLinks.length > 0) {
+      this.links = this.links.concat(newLinks);
+    }
+    this.linkVersion += 1;
+    hilog.info(0x0000, 'OpenSPHSync',
+      `kernel nodes=${g.nodes.length} links=${g.links.length} addedNodes=${added.length} addedLinks=${newLinks.length}`);
+  }
+
   private startSimExportVideo(): void {
     // 优先走 C++ 原生预设（绕开「按字符串键写设置」不可靠的问题）
     if (this.nodes.length === 0) {
       let runHandle: number = -1;
       try {
+        interface PresetBody {
+          handle: number;
+          cx: number;
+          cy: number;
+          cz: number;
+          r: number;
+          slot: number;
+        }
         interface PresetRes {
           ok: boolean;
           run?: number;
+          handles?: number[];
+          classes?: string[];
+          links?: number[][];
+          bodies?: PresetBody[];
           error?: string;
         }
         const res: PresetRes = JSON.parse(String(ark.buildRochePreset())) as PresetRes;
-        if (res.ok && res.run !== undefined) {
+        if (res.ok && res.run !== undefined && res.handles !== undefined
+          && res.classes !== undefined && res.links !== undefined) {
           runHandle = res.run;
-          hilog.info(0x0000, 'OpenSPHRoche', `native preset ok run=${runHandle}`);
+          // 按「依赖深度」摆成从左到右的列，并把连接画出来
+          const cols: number[] = [0, 1, 1, 2, 3, 4];
+          const made: GraphNode[] = [];
+          const idByHandle: Map<number, number> = new Map<number, number>();
+          for (let i = 0; i < res.handles.length; i++) {
+            const col: number = i < cols.length ? cols[i] : i;
+            const n: GraphNode = new GraphNode(this.nextId, res.handles[i], res.classes[i],
+              this.nodeTitle(res.classes[i]), this.label(res.classes[i]),
+              60 + col * 190, 90 + (i % 2) * 120);
+            this.nextId += 1;
+            made.push(n);
+            idByHandle.set(res.handles[i], n.id);
+          }
+          const newLinks: GraphLink[] = [];
+          for (const pair of res.links) {
+            if (pair.length < 2) {
+              continue;
+            }
+            const fromId: number | undefined = idByHandle.get(res.handles[pair[0]]);
+            const toId: number | undefined = idByHandle.get(res.handles[pair[1]]);
+            if (fromId === undefined || toId === undefined) {
+              continue;
+            }
+            const l: GraphLink = { id: this.nextId, from: fromId, to: toId };
+            this.nextId += 1;
+            newLinks.push(l);
+          }
+          this.nodes = this.nodes.concat(made);
+          this.links = this.links.concat(newLinks);
+          const runNodeId: number | undefined = idByHandle.get(res.run);
+          if (runNodeId !== undefined) {
+            this.selectedNode = runNodeId;
+          }
+          // 天体表 → 渲染器（按天体归属选贴图）
+          if (res.bodies !== undefined && res.bodies.length > 0) {
+            const parts: string[] = [];
+            for (const b of res.bodies) {
+              this.bodySlots.set(b.handle, b.slot);
+              parts.push(`{"cx":${b.cx},"cy":${b.cy},"cz":${b.cz},"r":${b.r},"slot":${b.slot}}`);
+            }
+            this.bodyInfo = `[${parts.join(',')}]`;
+            hilog.info(0x0000, 'OpenSPHRoche', `bodies -> ${String(ark.setBodyTextures(this.bodyInfo))}`);
+          }
+          this.linkVersion += 1;
+          this.syncCanvasFromKernel();
+          hilog.info(0x0000, 'OpenSPHRoche',
+            `native preset ok run=${runHandle} nodes=${made.length} links=${newLinks.length}`);
         } else {
           hilog.warn(0x0000, 'OpenSPHRoche', `native preset failed: ${res.error ?? 'unknown'}`);
         }
       } catch (e) {
         hilog.warn(0x0000, 'OpenSPHRoche', `native preset threw: ${String(e)}`);
-      }
-      if (runHandle >= 0) {
-        const n: GraphNode = new GraphNode(this.nextId, runHandle, 'SPH run',
-          this.nodeTitle('SPH run'), this.label('simulation'), 400, 200);
-        this.nextId += 1;
-        this.nodes = this.nodes.concat([n]);
-        this.selectedNode = n.id;
-        this.linkVersion += 1;
       }
     }
     let node: GraphNode | undefined = this.nodeById(this.selectedNode);
@@ -1220,6 +1359,7 @@ struct ArkMain {
     }
     const name: string = this.exportName.length > 0 ? this.exportName : 'opensph-sim';
     const path: string = `${dir}/${name}.mp4`;
+    this.pendingSimPath = path;
     if (fs.accessSync(path)) {
       try {
         fs.unlinkSync(path);
@@ -1237,7 +1377,7 @@ struct ArkMain {
       path: string;
     }
     const opts: SimExportOptions = {
-      width: 3840, height: 2160, fps: 60, frames: 600,
+      width: 3840, height: 2160, fps: 60, frames: 3600,
       bitrate: 40000000, duration: 2500, path: path
     };
     let res: string = '';
@@ -1253,7 +1393,12 @@ struct ArkMain {
       this.noticeService.error('无法渲染模拟', res);
       return;
     }
-    this.noticeService.info('开始渲染模拟', '4K60 · 600 帧');
+    // 打开导出对话框，进度条与「模拟渲染 n/total 帧」才会显示出来
+    this.exportMode = 0;
+    this.exportVisible = true;
+    this.exportStatusText = '模拟渲染 0 / 3600 帧';
+    this.exportProgress = 0;
+    this.noticeService.info('开始渲染模拟', '4K60 · 60 秒 · 3600 帧（进度见导出对话框）');
     const timer: number = setInterval(() => {
       interface SimExpStatus {
         active: boolean;
@@ -1281,10 +1426,229 @@ struct ArkMain {
         clearInterval(timer);
       } else if (!st.active) {
         hilog.info(0x0000, 'OpenSPHSimExp', `done ${st.rendered} frames`);
-        this.noticeService.success('模拟渲染完成', `${st.rendered} 帧`);
+        this.noticeService.success('模拟渲染完成', `${st.rendered} 帧，请选择保存位置（桌面）`);
         clearInterval(timer);
+        this.saveVideoToUser(this.pendingSimPath, 'moon-roche-4k60.mp4');
       }
     }, 700);
+  }
+
+  // 把渲染好的视频另存到用户选择的位置（鸿蒙电脑桌面）：
+  // 应用沙箱内的文件无法直接被外部访问，必须经系统文件保存对话框（picker）落到用户目录。
+  // ---- 远程接口：默认关闭，需用户显式开启 ----
+  private remoteStatusJson(): string {
+    let st: string = '{}';
+    try {
+      st = String(ark.simExportStatus());
+    } catch (e) {
+      st = '{\"error\":\"status unavailable\"}';
+    }
+    return `{"remote":true,"port":${this.remotePort},"wan":${this.remoteWan},`
+      + `"password":${this.remote.hasPassword()},"export":${st}}`;
+  }
+
+  private startRemoteServer(): void {
+    if (this.remotePwdDraft.length > 0) {
+      this.remote.setPassword(this.remotePwdDraft);
+    } else {
+      this.remote.setPassword('');
+    }
+    this.remote.start(this.remotePort, (req: RemoteRequest): RemoteReply => {
+      if (req.cmd === 'status') {
+        const rr: RemoteReply = { ok: true, data: this.remoteStatusJson() };
+        return rr;
+      }
+      if (req.cmd === 'preset') {
+        let out: string = '';
+        try {
+          out = String(ark.buildRochePreset());
+          this.syncCanvasFromKernel();
+        } catch (e) {
+          out = String(e);
+        }
+        const rr: RemoteReply = { ok: true, data: out };
+        return rr;
+      }
+      if (req.cmd === 'export') {
+        this.startSimExportVideo();
+        const rr: RemoteReply = { ok: true, data: '{"started":true}' };
+        return rr;
+      }
+      if (req.cmd === 'video') {
+        const info: string = `{"path":"${this.pendingSimPath}"}`;
+        const rr: RemoteReply = { ok: true, data: info };
+        return rr;
+      }
+      const rr: RemoteReply = { ok: false, error: 'unknown cmd' };
+      return rr;
+    });
+    this.remoteEnabled = true;
+    this.remoteAddrText = `监听端口 ${this.remotePort}（IPv4 + IPv6 双栈）`;
+    this.noticeService.info('远程接口已开启',
+      this.remote.hasPassword() ? '需要密码' : '无密码（仅建议局域网使用）');
+  }
+
+  private stopRemoteServer(): void {
+    this.remote.stop();
+    this.remoteEnabled = false;
+    this.remoteAddrText = '未启动';
+    this.noticeService.info('远程接口已关闭', '端口已释放');
+  }
+
+  @Builder
+  remotePanel() {
+    Column() {
+      Row() {
+        Text('远程接口').fontSize(15).fontWeight(FontWeight.Medium).layoutWeight(1);
+        Text('×').fontSize(16).fontColor('#5f6670')
+          .width(28).height(28).textAlign(TextAlign.Center)
+          .onClick(() => { this.remoteVisible = false; });
+      }.width('100%').margin({ bottom: 10 })
+
+      Text(this.remoteAddrText).fontSize(12).fontColor('#8b929b')
+        .width('100%').margin({ bottom: 8 })
+
+      Row() {
+        Text('启用').fontSize(13).layoutWeight(1);
+        Toggle({ type: ToggleType.Switch, isOn: this.remoteEnabled })
+          .selectedColor('#0b57d0')
+          .onChange((on: boolean) => {
+            if (on) {
+              this.startRemoteServer();
+            } else {
+              this.stopRemoteServer();
+            }
+          })
+      }.width('100%').margin({ bottom: 8 })
+
+      Row() {
+        Text('端口').fontSize(13).width(70);
+        TextInput({ text: String(this.remotePort) })
+          .type(InputType.Number).fontSize(13).height(30).layoutWeight(1)
+          .onChange((v: string) => {
+            const n: number = Number(v);
+            if (Number.isFinite(n) && n > 1024 && n < 65536) {
+              this.remotePort = Math.floor(n);
+            }
+          })
+      }.width('100%').margin({ bottom: 8 })
+
+      Row() {
+        Text('密码').fontSize(13).width(70);
+        TextInput({ text: this.remotePwdDraft, placeholder: '留空 = 无密码' })
+          .type(InputType.Password).fontSize(13).height(30).layoutWeight(1)
+          .onChange((v: string) => { this.remotePwdDraft = v; })
+      }.width('100%').margin({ bottom: 6 })
+
+      Text('留空表示不设密码：同一局域网内任何人都能调用渲染接口，请自行判断风险。')
+        .fontSize(10).fontColor('#c0784a').width('100%').margin({ bottom: 8 })
+
+      Row() {
+        Text('允许广域网').fontSize(13).layoutWeight(1);
+        Toggle({ type: ToggleType.Switch, isOn: this.remoteWan })
+          .selectedColor('#c0784a')
+          .onChange((on: boolean) => {
+            if (on && this.remotePwdDraft.length === 0) {
+              this.remoteWan = false;
+              this.noticeService.warn('需要先设置密码', '广域网访问必须启用密码');
+              return;
+            }
+            this.remoteWan = on;
+          })
+      }.width('100%').margin({ bottom: 6 })
+
+      Text('广域网访问的前提：本机有公网 IPv6 地址、上级网络放行入站端口。当前设备未检测到 IPv6 地址。')
+        .fontSize(10).fontColor('#8b929b').width('100%').margin({ bottom: 8 })
+
+      Text('命令：status / preset / export / video   协议：一行 JSON 请求 + 一行 JSON 响应')
+        .fontSize(10).fontColor('#8b929b').width('100%')
+    }
+    .width(420)
+    .padding(16)
+    .backgroundColor('#ffffff')
+    .borderRadius(14)
+    .shadow({ radius: 30, color: '#33000000', offsetY: 8 })
+  }
+
+  // 手动选择贴图：从设备里选一张等距圆柱（2:1）图片，解码为 RGBA 后上传到指定槽位。
+  // 槽位 0 = 主天体（地球），槽位 1 = 次天体（月球）。
+  // 给某个天体节点设置贴图：图片解码后上传到该节点专属槽位，再更新天体表
+  private async pickTextureForBody(nodeId: number): Promise<void> {
+    const node: GraphNode | undefined = this.nodeById(nodeId);
+    if (!node) {
+      return;
+    }
+    let slot: number | undefined = this.bodySlots.get(node.handle);
+    if (slot === undefined) {
+      slot = 2 + this.bodySlots.size;   // 新天体：分配新槽位
+      this.bodySlots.set(node.handle, slot);
+    }
+    await this.pickTextureForSlot(slot);
+  }
+
+  private async pickTextureForSlot(slot: number): Promise<void> {
+    try {
+      const opts: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      opts.maxSelectNumber = 1;
+      opts.fileSuffixFilters = ['.png', '.jpg', '.jpeg', '.webp'];
+      const docPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(
+        this.getUIContext().getHostContext() as common.UIAbilityContext);
+      const uris: string[] = await docPicker.select(opts);
+      if (uris.length === 0) {
+        this.noticeService.warn('未选择文件', '已取消');
+        return;
+      }
+      const f: fs.File = fs.openSync(uris[0], fs.OpenMode.READ_ONLY);
+      const src: image.ImageSource = image.createImageSource(f.fd);
+      const info: image.ImageInfo = await src.getImageInfo();
+      const decodeOpts: image.DecodingOptions = {
+        desiredPixelFormat: image.PixelMapFormat.RGBA_8888,
+        desiredSize: { width: info.size.width, height: info.size.height }
+      };
+      const pm: image.PixelMap = await src.createPixelMap(decodeOpts);
+      const bufSize: number = info.size.width * info.size.height * 4;
+      const ab: ArrayBuffer = new ArrayBuffer(bufSize);
+      await pm.readPixelsToBuffer(ab);
+      const res: string = String(ark.setTexture(slot, info.size.width, info.size.height, ab));
+      fs.closeSync(f);
+      this.textureName = slot === 0 ? '自定义地球贴图' : '自定义月球贴图';
+      hilog.info(0x0000, 'OpenSPHTex', `manual slot=${slot} ${info.size.width}x${info.size.height} -> ${res}`);
+      this.noticeService.success('贴图已应用',
+        `${slot === 0 ? '主天体' : '次天体'}：${info.size.width}×${info.size.height}`);
+      this.lastPixKey = '';
+      this.refreshPixel(this.yaw, this.pitch, true);
+    } catch (e) {
+      const err = e as Error;
+      hilog.error(0x0000, 'OpenSPHTex', `manual pick failed: ${err.message ?? String(e)}`);
+      this.noticeService.error('贴图应用失败', String(e));
+    }
+  }
+
+  private async saveVideoToUser(devicePath: string, name: string): Promise<void> {
+    try {
+      const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+      opts.newFileNames = [name];
+      opts.fileSuffixChoices = ['.mp4'];
+      const docPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(
+        this.getUIContext().getHostContext() as common.UIAbilityContext);
+      const uris: string[] = await docPicker.save(opts);
+      if (uris.length === 0) {
+        this.noticeService.warn('未保存', '已取消选择位置');
+        return;
+      }
+      const target: string = uris[0];
+      const src: fs.File = fs.openSync(devicePath, fs.OpenMode.READ_ONLY);
+      const dst: fs.File = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.copyFileSync(src.fd, dst.fd);
+      fs.closeSync(src);
+      fs.closeSync(dst);
+      hilog.info(0x0000, 'OpenSPHSave', `saved to ${target}`);
+      this.noticeService.success('已保存到所选位置', target);
+    } catch (e) {
+      const err = e as Error;
+      hilog.error(0x0000, 'OpenSPHSave', `save failed: ${err.message ?? String(e)}`);
+      this.noticeService.error('保存失败', String(e));
+    }
   }
 
   private applyExportPreset(id: number): void {
@@ -1344,28 +1708,30 @@ struct ArkMain {
 
   private uploadTexture(kind: number): void {
     try {
-      const W: number = 1024;
-      const H: number = 512;
+      const W: number = 512;
+      const H: number = 256;
       if (kind === 0) {
-        const res0: string = String(ark.setTexture(0, 0, new Uint8ClampedArray(0).buffer as ArrayBuffer));
+        const res0: string = String(ark.setTexture(0, 0, 0, new Uint8ClampedArray(0).buffer as ArrayBuffer));
+        const res1: string = String(ark.setTexture(1, 0, 0, new Uint8ClampedArray(0).buffer as ArrayBuffer));
         this.textureName = '无（按半径着色）';
-        hilog.info(0x0000, 'OpenSPHTex', `cleared -> ${res0}`);
+        hilog.info(0x0000, 'OpenSPHTex', `cleared -> ${res0} ${res1}`);
         return;
       }
       const buf: Uint8ClampedArray = new Uint8ClampedArray(W * H * 4);
-      // 月球环形山：预生成若干圆，供采样时叠加
+      const bufMoon: Uint8ClampedArray = new Uint8ClampedArray(W * H * 4);
       const craters: number[] = [];
       let seed: number = 12345;
       const rnd = (): number => {
         seed = (seed * 1103515245 + 12345) % 2147483648;
         return seed / 2147483648;
       };
-      for (let i = 0; i < 90; i++) {
-        craters.push(rnd());          // cx (0..1)
-        craters.push(rnd());          // cy (0..1)
-        craters.push(0.004 + rnd() * 0.03);  // 半径（UV 归一化）
-        craters.push(0.5 + rnd() * 0.5);     // 强度
+      for (let i = 0; i < 40; i++) {
+        craters.push(rnd());
+        craters.push(rnd());
+        craters.push(0.004 + rnd() * 0.03);
+        craters.push(0.5 + rnd() * 0.5);
       }
+      // 第一遍：类地球（蓝海 + 绿陆 + 极冠 + 云）
       for (let y = 0; y < H; y++) {
         const v: number = y / H;
         const lat: number = (0.5 - v) * Math.PI;
@@ -1373,59 +1739,64 @@ struct ArkMain {
           const u: number = x / W;
           const lon: number = u * Math.PI * 2;
           const o: number = (y * W + x) * 4;
-          if (kind === 1) {
-            // 类地球：海洋 + 大陆 + 极冠 + 云
-            const n: number = this.fbm(Math.cos(lon) * 2.2 + 5, Math.sin(lon) * 2.2 + Math.abs(lat) * 1.5, 4);
-            const land: boolean = n > 0.52;
-            const ice: boolean = Math.abs(lat) > 1.22 - 0.12 * n;
-            const cloud: number = this.fbm(u * 9 + 11, v * 9 + 3, 3);
-            if (ice) {
-              buf[o] = 236; buf[o + 1] = 242; buf[o + 2] = 248;
-            } else if (land) {
-              const g: number = Math.min(1, Math.max(0, (n - 0.52) * 4));
-              buf[o] = 96 + 60 * g; buf[o + 1] = 116 + 50 * g; buf[o + 2] = 62 + 30 * g;
-            } else {
-              const d: number = 0.45 + 0.55 * Math.cos(lat);
-              buf[o] = 18 + 26 * d; buf[o + 1] = 58 + 46 * d; buf[o + 2] = 128 + 74 * d;
-            }
-            if (cloud > 0.62) {
-              const c: number = Math.min(1, (cloud - 0.62) * 5) * 0.75;
-              buf[o] = buf[o] * (1 - c) + 245 * c;
-              buf[o + 1] = buf[o + 1] * (1 - c) + 248 * c;
-              buf[o + 2] = buf[o + 2] * (1 - c) + 252 * c;
-            }
+          const n: number = this.fbm(Math.cos(lon) * 2.2 + 5, Math.sin(lon) * 2.2 + Math.abs(lat) * 1.5, 4);
+          const land: boolean = n > 0.52;
+          const ice: boolean = Math.abs(lat) > 1.22 - 0.12 * n;
+          const cloud: number = 0;   // 省略云层采样：主线程开销太大
+          let rr: number = 0;
+          let gg: number = 0;
+          let bb: number = 0;
+          if (ice) {
+            rr = 236; gg = 242; bb = 248;
+          } else if (land) {
+            const g2: number = Math.min(1, Math.max(0, (n - 0.52) * 4));
+            rr = 96 + 60 * g2; gg = 116 + 50 * g2; bb = 62 + 30 * g2;
           } else {
-            // 类月球：灰色基底 + 月海 + 环形山
-            const base: number = this.fbm(u * 6 + 21, v * 6 + 7, 4);
-            let g: number = 118 + 58 * (base - 0.5) * 2;
-            // 月海（大块暗区）
-            const maria: number = this.fbm(u * 2.4 + 3, v * 2.4 + 13, 3);
-            if (maria > 0.56) {
-              g -= 34;
-            }
-            // 环形山：中心暗、边缘亮
-            for (let ci = 0; ci + 3 < craters.length; ci += 4) {
-              const dx: number = Math.min(Math.abs(u - craters[ci]), 1 - Math.abs(u - craters[ci]));
-              const dy: number = v - craters[ci + 1];
-              const d: number = Math.sqrt(dx * dx + dy * dy) / craters[ci + 2];
-              if (d < 1.0) {
-                const inten: number = craters[ci + 3];
-                if (d < 0.75) {
-                  g -= 26 * inten * (1 - d / 0.75);
-                } else {
-                  g += 30 * inten * (1 - (1 - d) / 0.25);
-                }
-              }
-            }
-            g = Math.max(28, Math.min(246, g));
-            buf[o] = g; buf[o + 1] = g * 0.99; buf[o + 2] = g * 0.95;
+            const d: number = 0.45 + 0.55 * Math.cos(lat);
+            rr = 18 + 26 * d; gg = 58 + 46 * d; bb = 128 + 74 * d;
           }
-          buf[o + 3] = 255;
+          if (cloud > 0.62) {
+            const c: number = Math.min(1, (cloud - 0.62) * 5) * 0.75;
+            rr = rr * (1 - c) + 245 * c;
+            gg = gg * (1 - c) + 248 * c;
+            bb = bb * (1 - c) + 252 * c;
+          }
+          buf[o] = rr; buf[o + 1] = gg; buf[o + 2] = bb; buf[o + 3] = 255;
         }
       }
-      const res: string = String(ark.setTexture(W, H, buf.buffer as ArrayBuffer));
-      this.textureName = kind === 1 ? `类地球 ${W}×${H}` : `类月球 ${W}×${H}`;
-      hilog.info(0x0000, 'OpenSPHTex', `kind=${kind} upload ${W}x${H} -> ${res}`);
+      // 第二遍：类月球（灰色 + 月海 + 环形山）
+      for (let y = 0; y < H; y++) {
+        const v: number = y / H;
+        for (let x = 0; x < W; x++) {
+          const u: number = x / W;
+          const o: number = (y * W + x) * 4;
+          const base: number = this.fbm(u * 6 + 21, v * 6 + 7, 4);
+          let g2: number = 118 + 58 * (base - 0.5) * 2;
+          const maria: number = this.fbm(u * 2.4 + 3, v * 2.4 + 13, 3);
+          if (maria > 0.56) {
+            g2 -= 34;
+          }
+          for (let ci = 0; ci + 3 < craters.length; ci += 4) {
+            const dx: number = Math.min(Math.abs(u - craters[ci]), 1 - Math.abs(u - craters[ci]));
+            const dy: number = v - craters[ci + 1];
+            const d: number = Math.sqrt(dx * dx + dy * dy) / craters[ci + 2];
+            if (d < 1.0) {
+              const inten: number = craters[ci + 3];
+              if (d < 0.75) {
+                g2 -= 26 * inten * (1 - d / 0.75);
+              } else {
+                g2 += 30 * inten * (1 - (1 - d) / 0.25);
+              }
+            }
+          }
+          g2 = Math.max(28, Math.min(246, g2));
+          bufMoon[o] = g2; bufMoon[o + 1] = g2 * 0.99; bufMoon[o + 2] = g2 * 0.95; bufMoon[o + 3] = 255;
+        }
+      }
+      const resE: string = String(ark.setTexture(0, W, H, buf.buffer as ArrayBuffer));
+      const resM: string = String(ark.setTexture(1, W, H, bufMoon.buffer as ArrayBuffer));
+      this.textureName = `地球+月球贴图 ${W}×${H}`;
+      hilog.info(0x0000, 'OpenSPHTex', `upload slot0=${resE} slot1=${resM}`);
     } catch (e) {
       const err = e as Error;
       hilog.error(0x0000, 'OpenSPHTex', `upload failed: ${err.message ?? String(e)}`);
@@ -2652,6 +3023,16 @@ struct ArkMain {
         });
         hilog.info(0x0000, 'OpenSPHPane', `menu wide-right -> leftW=${this.leftW} rightW=${this.rightW}`);
         this.savePaneWidths();
+      } else if (index === 10) {
+        this.pickTextureForSlot(0);
+      } else if (index === 11) {
+        this.pickTextureForSlot(1);
+      } else if (index === 9) {
+        if (this.remoteEnabled) {
+          this.stopRemoteServer();
+        } else {
+          this.remoteVisible = true;
+        }
       } else if (index === 8) {
         // 纹理循环：类月球 → 类地球 → 无 → 类月球…
         this.textureKind = (this.textureKind + 1) % 3;
@@ -2728,7 +3109,9 @@ struct ArkMain {
       return ['节点图', '预览', this.autoRotate ? '停止自动旋转' : '自动旋转',
         '复位画布', this.reduceMotion ? '恢复动效' : '减少动效',
         '加宽左栏', '加宽右栏', '复位面板宽度',
-        `纹理：${this.textureKind === 0 ? '无' : (this.textureKind === 1 ? '类地球' : '类月球')}`];
+        `纹理：${this.textureKind === 0 ? '无' : (this.textureKind === 1 ? '类地球' : '类月球')}`,
+        this.remoteEnabled ? '关闭远程接口' : '开启远程接口',
+        '选择主天体贴图…', '选择次天体贴图…'];
     }
     if (name === '模拟') {
       return ['开始运行', this.simPaused ? '继续' : '暂停', '停止',
@@ -2921,7 +3304,7 @@ struct ArkMain {
 
   private nodeCtxItems(): string[] {
     return ['查看属性', '预览此节点', '渲染此节点', '开始运行',
-      '克隆', '克隆整棵树', '自动布局', '删除', '删除整棵树'];
+      '克隆', '克隆整棵树', '自动布局', '删除', '删除整棵树', '设置贴图…'];
   }
 
   private runNodeCtxAction(index: number): void {
@@ -4487,6 +4870,17 @@ struct ArkMain {
       if (this.exportVisible) {
         Column() {
           this.exportDialog()
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Center)
+        .backgroundColor('#40000000')
+        .hitTestBehavior(HitTestMode.Transparent)
+      }
+      if (this.remoteVisible) {
+        Column() {
+          this.remotePanel()
         }
         .width('100%')
         .height('100%')
