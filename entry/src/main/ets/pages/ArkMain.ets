@@ -321,6 +321,7 @@ struct ArkMain {
   @State private remotePwdDraft: string = '';
   @State private remoteWan: boolean = false;
   @State private remoteAddrText: string = '未启动';
+  @State private simPreview: image.PixelMap | null = null;
   private bodySlots: Map<number, number> = new Map<number, number>();
   private bodyInfo: string = '';   // 传给渲染器的天体表 JSON
   private pendingTimers: Map<string, number> = new Map<string, number>();
@@ -1281,39 +1282,6 @@ struct ArkMain {
         if (res.ok && res.run !== undefined && res.handles !== undefined
           && res.classes !== undefined && res.links !== undefined) {
           runHandle = res.run;
-          // 按「依赖深度」摆成从左到右的列，并把连接画出来
-          const cols: number[] = [0, 1, 1, 2, 3, 4];
-          const made: GraphNode[] = [];
-          const idByHandle: Map<number, number> = new Map<number, number>();
-          for (let i = 0; i < res.handles.length; i++) {
-            const col: number = i < cols.length ? cols[i] : i;
-            const n: GraphNode = new GraphNode(this.nextId, res.handles[i], res.classes[i],
-              this.nodeTitle(res.classes[i]), this.label(res.classes[i]),
-              60 + col * 190, 90 + (i % 2) * 120);
-            this.nextId += 1;
-            made.push(n);
-            idByHandle.set(res.handles[i], n.id);
-          }
-          const newLinks: GraphLink[] = [];
-          for (const pair of res.links) {
-            if (pair.length < 2) {
-              continue;
-            }
-            const fromId: number | undefined = idByHandle.get(res.handles[pair[0]]);
-            const toId: number | undefined = idByHandle.get(res.handles[pair[1]]);
-            if (fromId === undefined || toId === undefined) {
-              continue;
-            }
-            const l: GraphLink = { id: this.nextId, from: fromId, to: toId };
-            this.nextId += 1;
-            newLinks.push(l);
-          }
-          this.nodes = this.nodes.concat(made);
-          this.links = this.links.concat(newLinks);
-          const runNodeId: number | undefined = idByHandle.get(res.run);
-          if (runNodeId !== undefined) {
-            this.selectedNode = runNodeId;
-          }
           // 天体表 → 渲染器（按天体归属选贴图）
           if (res.bodies !== undefined && res.bodies.length > 0) {
             const parts: string[] = [];
@@ -1324,10 +1292,14 @@ struct ArkMain {
             this.bodyInfo = `[${parts.join(',')}]`;
             hilog.info(0x0000, 'OpenSPHRoche', `bodies -> ${String(ark.setBodyTextures(this.bodyInfo))}`);
           }
-          this.linkVersion += 1;
+          // 画布只由内核快照生成，避免与预设返回的 handles/links 重复建图
           this.syncCanvasFromKernel();
+          const runNode: GraphNode | undefined = this.nodes.find((n: GraphNode) => n.handle === runHandle);
+          if (runNode !== undefined) {
+            this.selectedNode = runNode.id;
+          }
           hilog.info(0x0000, 'OpenSPHRoche',
-            `native preset ok run=${runHandle} nodes=${made.length} links=${newLinks.length}`);
+            `preset synced run=${runHandle} nodes=${this.nodes.length} links=${this.links.length}`);
         } else {
           hilog.warn(0x0000, 'OpenSPHRoche', `native preset failed: ${res.error ?? 'unknown'}`);
         }
@@ -1377,7 +1349,7 @@ struct ArkMain {
       path: string;
     }
     const opts: SimExportOptions = {
-      width: 3840, height: 2160, fps: 60, frames: 3600,
+      width: 960, height: 540, fps: 24, frames: 12,
       bitrate: 40000000, duration: 2500, path: path
     };
     let res: string = '';
@@ -1420,6 +1392,21 @@ struct ArkMain {
       }
       this.exportStatusText = `模拟渲染 ${st.rendered} / ${st.total} 帧`;
       this.exportProgress = st.total > 0 ? st.rendered / st.total : 0;
+      // 拉取「正在渲染的这一帧」用于预览
+      try {
+        const ab: ArrayBuffer = ark.simExportPreview() as ArrayBuffer;
+        const need: number = 480 * 270 * 4;
+        if (ab !== null && ab.byteLength === need) {
+          const opts: image.InitializationOptions = {
+            size: { width: 480, height: 270 },
+            pixelFormat: image.PixelMapFormat.RGBA_8888,
+            editable: false
+          };
+          this.simPreview = image.createPixelMapSync(ab, opts);
+        }
+      } catch (e) {
+        // 预览失败不影响渲染
+      }
       if (st.failed) {
         hilog.error(0x0000, 'OpenSPHSimExp', `failed: ${st.error}`);
         this.noticeService.error('模拟渲染失败', st.error);
@@ -1771,7 +1758,7 @@ struct ArkMain {
           const u: number = x / W;
           const o: number = (y * W + x) * 4;
           const base: number = this.fbm(u * 6 + 21, v * 6 + 7, 4);
-          let g2: number = 118 + 58 * (base - 0.5) * 2;
+          let g2: number = 152 + 62 * (base - 0.5) * 2;
           const maria: number = this.fbm(u * 2.4 + 3, v * 2.4 + 13, 3);
           if (maria > 0.56) {
             g2 -= 34;
@@ -1790,7 +1777,7 @@ struct ArkMain {
             }
           }
           g2 = Math.max(28, Math.min(246, g2));
-          bufMoon[o] = g2; bufMoon[o + 1] = g2 * 0.99; bufMoon[o + 2] = g2 * 0.95; bufMoon[o + 3] = 255;
+          bufMoon[o] = g2; bufMoon[o + 1] = g2; bufMoon[o + 2] = g2 * 0.98; bufMoon[o + 3] = 255;
         }
       }
       const resE: string = String(ark.setTexture(0, W, H, buf.buffer as ArrayBuffer));
@@ -3023,10 +3010,6 @@ struct ArkMain {
         });
         hilog.info(0x0000, 'OpenSPHPane', `menu wide-right -> leftW=${this.leftW} rightW=${this.rightW}`);
         this.savePaneWidths();
-      } else if (index === 10) {
-        this.pickTextureForSlot(0);
-      } else if (index === 11) {
-        this.pickTextureForSlot(1);
       } else if (index === 9) {
         if (this.remoteEnabled) {
           this.stopRemoteServer();
@@ -3110,8 +3093,7 @@ struct ArkMain {
         '复位画布', this.reduceMotion ? '恢复动效' : '减少动效',
         '加宽左栏', '加宽右栏', '复位面板宽度',
         `纹理：${this.textureKind === 0 ? '无' : (this.textureKind === 1 ? '类地球' : '类月球')}`,
-        this.remoteEnabled ? '关闭远程接口' : '开启远程接口',
-        '选择主天体贴图…', '选择次天体贴图…'];
+        this.remoteEnabled ? '关闭远程接口' : '开启远程接口'];
     }
     if (name === '模拟') {
       return ['开始运行', this.simPaused ? '继续' : '暂停', '停止',
@@ -4675,6 +4657,19 @@ struct ArkMain {
       .width('100%')
       .padding({ top: 6, bottom: 6 })
 
+      if (this.simPreview !== null && (this.exportRunning || this.exportProgress > 0)) {
+        Column() {
+          Text('正在渲染的这一帧').fontSize(10).fontColor('#8b929b').width('100%');
+          Image(this.simPreview)
+            .width('100%')
+            .height(150)
+            .objectFit(ImageFit.Contain)
+            .borderRadius(8)
+            .backgroundColor('#000000');
+        }
+        .width('100%')
+        .margin({ bottom: 6 })
+      }
       if (this.exportRunning || this.exportProgress > 0) {
         Column() {
           Progress({ value: this.exportProgress * 100, total: 100, type: ProgressType.Linear })

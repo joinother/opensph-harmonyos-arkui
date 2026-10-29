@@ -503,7 +503,8 @@ static void splatPoints(const std::vector<float>& pts,
                 const double amb = 0.16;
                 const double shade = std::min(1.25, amb + 0.95 * diff);
                 const size_t o = zi * 4;
-                const double rr = tr * 255.0 * shade + 200.0 * spec;
+                const double specW = 200.0 * spec;
+                const double rr = tr * 255.0 * shade + specW;
                 const double gg = tg * 255.0 * shade + 200.0 * spec;
                 const double bb = tb * 255.0 * shade + 200.0 * spec;
                 out[o] = uint8_t(std::min(255.0, rr));
@@ -1610,12 +1611,12 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
         // 地球：放大 2 倍以降低数密度（提速），半径 12742 km
         SharedPtr<JobNode> earth = makeNode<MonolithicBodyIc>(String::fromUtf8("earth"));
         earth->getSettings().set(BodySettingsId::BODY_RADIUS, Float(1.2742e7f));
-        earth->getSettings().set(BodySettingsId::PARTICLE_COUNT, int(40000));
+        earth->getSettings().set(BodySettingsId::PARTICLE_COUNT, int(10000));
 
         // 月球：半径 3474 km + 标量 Grady-Kipp 碎裂 + Drucker-Prager 屈服
         SharedPtr<JobNode> moon = makeNode<MonolithicBodyIc>(String::fromUtf8("moon"));
         moon->getSettings().set(BodySettingsId::BODY_RADIUS, Float(3.474e6f));
-        moon->getSettings().set(BodySettingsId::PARTICLE_COUNT, int(40000));
+        moon->getSettings().set(BodySettingsId::PARTICLE_COUNT, int(10000));
         moon->getSettings().set(BodySettingsId::RHEOLOGY_DAMAGE,
             EnumWrapper(FractureEnum::SCALAR_GRADY_KIPP));
         moon->getSettings().set(BodySettingsId::RHEOLOGY_YIELDING,
@@ -1633,10 +1634,19 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
         join->getSettings().set("com", false);
         join->getSettings().set("unique_flags", true);
 
+        // 域边界（原版 SPH run 有两个输入：particles 与 boundary）
+        SharedPtr<JobNode> domain = makeNode<BlockJob>(String::fromUtf8("boundary"));
+        {
+            VirtualSettings ds = domain->getSettings();
+            const Vector domainSize(1.2e8_f, 1.2e8_f, 1.2e8_f);   // 远大于系统尺度，避免粒子撞边界
+            ds.set("dimensions", domainSize);
+            ds.set("center", Vector(0._f, 0._f, 0._f));
+        }
+
         // 模拟：Barnes-Hut 自引力 + 100 s 最大时间步
         SharedPtr<JobNode> run = makeNode<SphJob>(String::fromUtf8("SPH run"), EMPTY_SETTINGS);
         run->getSettings().set(RunSettingsId::GRAVITY_SOLVER, EnumWrapper(GravityEnum::BARNES_HUT));
-        run->getSettings().set(RunSettingsId::TIMESTEPPING_MAX_TIMESTEP, 10._f);
+        run->getSettings().set(RunSettingsId::TIMESTEPPING_MAX_TIMESTEP, 20._f);
 
         // 连线（provider -> consumer, slot）
         moon->connect(shift, String::fromUtf8("particles"));
@@ -1645,6 +1655,7 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
         earth->connect(join, String::fromUtf8("particles A"));
         kepler->connect(join, String::fromUtf8("particles B"));
         join->connect(run, String::fromUtf8("particles"));
+        domain->connect(run, String::fromUtf8("boundary"));
 
         // 注册到句柄表，供 ArkTS 选中与导出
         const int hEarth = nextNodeHandle++;
@@ -1657,6 +1668,8 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
         nodeRegistry().insert(std::make_pair(hKepler, kepler));
         const int hJoin = nextNodeHandle++;
         nodeRegistry().insert(std::make_pair(hJoin, join));
+        const int hDomain = nextNodeHandle++;
+        nodeRegistry().insert(std::make_pair(hDomain, domain));
         const int hRun = nextNodeHandle++;
         nodeRegistry().insert(std::make_pair(hRun, run));
 
@@ -1668,10 +1681,10 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
         return makeString(env, "{\"ok\":true,\"run\":" + std::to_string(hRun)
             + ",\"handles\":[" + std::to_string(hEarth) + "," + std::to_string(hMoon) + ","
             + std::to_string(hShift) + "," + std::to_string(hKepler) + "," + std::to_string(hJoin) + ","
-            + std::to_string(hRun) + "]"
+            + std::to_string(hRun) + "," + std::to_string(hDomain) + "]"
             + ",\"classes\":[\"create monolithic body\",\"create monolithic body\",\"transform\","
-            + "\"set Keplerian velocity\",\"join\",\"SPH run\"]"
-            + ",\"links\":[[1,2],[0,3],[2,3],[0,4],[3,4],[4,5]]"
+            + "\"set Keplerian velocity\",\"join\",\"SPH run\",\"block\"]"
+            + ",\"links\":[[1,2],[0,3],[2,3],[0,4],[3,4],[4,5],[6,5]]"
             + ",\"bodies\":[{\"handle\":" + std::to_string(hEarth) + ",\"cx\":0,\"cy\":0,\"cz\":0"
             + ",\"r\":" + std::to_string(1.2742e7f) + ",\"slot\":0}"
             + ",{\"handle\":" + std::to_string(hMoon) + ",\"cx\":0,\"cy\":" + std::to_string(2.29e7f)
@@ -2115,12 +2128,14 @@ napi_value listJobGraph(napi_env env, napi_callback_info) {
             json += ",";
         }
         firstNode = false;
-        const char* cls = "job";
+        // 注意：className() 返回临时 String，必须先存下来再取 cstr，否则指针悬垂导致 JSON 乱码
+        std::string cls = "job";
         if (node->getJob()) {
-            cls = node->getJob()->className().toUtf8().cstr();
+            const String className = node->getJob()->className();
+            cls = className.toUtf8().cstr();
         }
         json += "{\"handle\":" + std::to_string(kv.first)
-            + ",\"class\":\"" + jsonEscape(String::fromUtf8(cls)) + "\"}";
+            + ",\"class\":\"" + jsonEscape(String::fromUtf8(cls.c_str())) + "\"}";
     }
     json += "],\"links\":[";
     bool firstLink = true;
@@ -2413,6 +2428,12 @@ struct SimExportState {
     std::string error;
 };
 
+// 渲染中预览：最近一帧的缩小版（480x270），由 UI 轮询取走
+static std::mutex g_prevMutex;
+static std::vector<uint8_t> g_prevFrame;
+static const int kPrevW = 480;
+static const int kPrevH = 270;
+
 static SimExportState& simExportState() {
     static SimExportState st;
     return st;
@@ -2434,6 +2455,23 @@ static bool renderSimFrame(const std::vector<float>& pts, const double yaw, cons
     if (rgba.size() != size_t(w) * size_t(h) * 4) {
         err = String::fromUtf8("渲染缓冲尺寸不匹配");
         return false;
+    }
+    // 顺带生成一张缩小预览（步进采样），供界面在渲染过程中显示
+    {
+        std::lock_guard<std::mutex> lock(g_prevMutex);
+        g_prevFrame.resize(size_t(kPrevW) * size_t(kPrevH) * 4);
+        for (int py = 0; py < kPrevH; ++py) {
+            const int sy = py * h / kPrevH;
+            for (int px = 0; px < kPrevW; ++px) {
+                const int sx = px * w / kPrevW;
+                const size_t so = (size_t(sy) * size_t(w) + size_t(sx)) * 4;
+                const size_t po = (size_t(py) * size_t(kPrevW) + size_t(px)) * 4;
+                g_prevFrame[po] = rgba[so];
+                g_prevFrame[po + 1] = rgba[so + 1];
+                g_prevFrame[po + 2] = rgba[so + 2];
+                g_prevFrame[po + 3] = 255;
+            }
+        }
     }
     Bitmap<Rgba> frame(Pixel(w, h));
     for (int y = 0; y < h; ++y) {
@@ -2641,6 +2679,24 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
     });
     worker.detach();
     return makeString(env, "{\"ok\":true,\"frames\":" + std::to_string(total) + "}");
+}
+
+napi_value simExportPreview(napi_env env, napi_callback_info) {
+    std::vector<uint8_t> copy;
+    {
+        std::lock_guard<std::mutex> lock(g_prevMutex);
+        copy = g_prevFrame;
+    }
+    if (copy.empty()) {
+        return makeString(env, "{\"ok\":false}");
+    }
+    void* data = nullptr;
+    napi_value ab;
+    if (napi_create_arraybuffer(env, copy.size(), &data, &ab) != napi_ok) {
+        return makeString(env, "{\"ok\":false}");
+    }
+    std::memcpy(data, copy.data(), copy.size());
+    return ab;
 }
 
 napi_value simExportStatus(napi_env env, napi_callback_info) {
@@ -2902,6 +2958,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"exportCloudVideo", nullptr, exportCloudVideo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startSimExport", nullptr, startSimExport, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"simExportStatus", nullptr, simExportStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"simExportPreview", nullptr, simExportPreview, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startExportVideo", nullptr, startExportVideo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportStatus", nullptr, exportStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startRecording", nullptr, startRecording, nullptr, nullptr, nullptr, napi_default, nullptr},
