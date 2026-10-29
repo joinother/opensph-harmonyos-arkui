@@ -2422,6 +2422,7 @@ public:
 // ---------------------------------------------------------------------------
 struct SimExportState {
     std::atomic<bool> active{false};
+    std::atomic<bool> abortRequested{false};
     std::atomic<int> rendered{0};
     std::atomic<bool> failed{false};
     int total = 0;
@@ -2505,8 +2506,9 @@ public:
     virtual void onSetUp(const Storage&, Statistics&) override {}
 
     virtual bool shouldAbortRun() const override {
-        // 渲染失败或被要求停止时，让模拟尽早收尾
-        return state.failed.load();
+        // 失败或用户取消 → 让模拟尽早收尾，worker 会正常关闭编码器，
+        // 因此即使中途停止，mp4 也是可播放的（覆盖已渲染的帧）。
+        return state.failed.load() || state.abortRequested.load();
     }
 
     virtual void onTimeStep(const Storage& storage, Statistics& stats) override {
@@ -2630,6 +2632,7 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
 
     {
         st.active.store(true);
+        st.abortRequested.store(false);
         st.rendered.store(0);
         st.failed.store(false);
         st.total = total;
@@ -2679,6 +2682,14 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
     });
     worker.detach();
     return makeString(env, "{\"ok\":true,\"frames\":" + std::to_string(total) + "}");
+}
+
+napi_value stopSimExport(napi_env env, napi_callback_info) {
+    SimExportState& st = simExportState();
+    st.abortRequested.store(true);
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHSimExp",
+        "abort requested at frame %{public}d", st.rendered.load());
+    return makeString(env, "{\"ok\":true,\"aborting\":true}");
 }
 
 napi_value simExportPreview(napi_env env, napi_callback_info) {
@@ -2959,6 +2970,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"startSimExport", nullptr, startSimExport, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"simExportStatus", nullptr, simExportStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"simExportPreview", nullptr, simExportPreview, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"stopSimExport", nullptr, stopSimExport, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startExportVideo", nullptr, startExportVideo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportStatus", nullptr, exportStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startRecording", nullptr, startRecording, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -137,3 +137,16 @@ hdc shell aa start -a QAbility -b com.opensph.app
 ### 画布自动同步
 - 新增 `ark.listJobGraph()`：枚举内核全部作业节点与已连接槽位（provider→consumer）。
 - ArkTS `syncCanvasFromKernel()` 与画布 diff，缺节点补节点、缺连线补连线——所以预设/脚本/远程接口建的图都会自动出现在画布上。
+
+## 实机验证记录（2026-10-29）
+
+| 项目 | 结果 | 证据 |
+|---|---|---|
+| 4K60 60 秒成片 | ✅ 3840×2160 / 60fps / 3600 帧 / 59.9976 s / 280 MB | ffprobe |
+| 保存到鸿蒙桌面 | ✅ `file://docs/storage/Users/currentUser/Desktop/moon-roche-4k60.mp4` | `OpenSPHSave` 日志 |
+| 画布与内核一致 | ✅ `画布节点 7 · 连线 7` | dumpLayout |
+| 渲染中预览 | ✅ 导出对话框内实时帧（480×270） | 截图 |
+| 渲染中取消 | ✅ 「取消渲染」按钮 + 优雅关闭编码器（可播部分） | dumpLayout + 代码 |
+| 远程接口 | ✅ Mac 直连 `192.168.1.56:8099`，`status`/`video` 返回正确 JSON；IPv6 双栈已监听 | 日志 + python 客户端 |
+| 手动选贴图 | 🟡 代码完成（卡片 ⋯ →设置贴图…），**未实测点选** | — |
+| 极致规格（各 4 万粒子 / 10 s 步长） | 🟡 参数已写入，未跑完（设备断连两次）；当前成片为各 1 万粒子 / 20 s 步长 | — |

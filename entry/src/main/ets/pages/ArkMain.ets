@@ -1349,7 +1349,7 @@ struct ArkMain {
       path: string;
     }
     const opts: SimExportOptions = {
-      width: 960, height: 540, fps: 24, frames: 12,
+      width: 3840, height: 2160, fps: 60, frames: 3600,
       bitrate: 40000000, duration: 2500, path: path
     };
     let res: string = '';
@@ -4669,6 +4669,23 @@ struct ArkMain {
         }
         .width('100%')
         .margin({ bottom: 6 })
+      }
+      if (this.exportProgress > 0 && this.exportProgress < 1) {
+        Button('取消渲染')
+          .fontSize(12)
+          .height(30)
+          .width('100%')
+          .backgroundColor('#f0f2f5')
+          .fontColor('#c0392b')
+          .margin({ top: 4, bottom: 4 })
+          .onClick(() => {
+            try {
+              ark.stopSimExport();
+              this.noticeService.info('正在停止', '已渲染的帧会保留为可播放视频');
+            } catch (e) {
+              this.noticeService.error('取消失败', String(e));
+            }
+          })
       }
       if (this.exportRunning || this.exportProgress > 0) {
         Column() {
