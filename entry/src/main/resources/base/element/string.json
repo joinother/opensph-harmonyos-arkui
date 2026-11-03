@@ -1,7 +1,16 @@
 {
   "string": [
-    { "name": "module_desc", "value": "OpenSPH SPH/N-body simulation for HarmonyOS" },
-    { "name": "EntryAbility_desc", "value": "OpenSPH main entry" },
-    { "name": "EntryAbility_label", "value": "OpenSPH" }
+    {
+      "name": "module_desc",
+      "value": "宇宙工坊 — 天体撞击与演化模拟（鸿蒙 ArkUI）"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "宇宙工坊主入口"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "宇宙工坊"
+    }
   ]
 }

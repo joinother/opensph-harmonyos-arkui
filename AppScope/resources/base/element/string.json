@@ -1,5 +1,8 @@
 {
   "string": [
-    { "name": "app_name", "value": "OpenSPH" }
+    {
+      "name": "app_name",
+      "value": "宇宙工坊"
+    }
   ]
 }

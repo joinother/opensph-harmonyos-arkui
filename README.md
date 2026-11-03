@@ -1,6 +1,11 @@
-# OpenSPH · 鸿蒙 ArkUI 版
+# 宇宙工坊 · 鸿蒙 ArkUI 版
 
-把 [OpenSPH](https://github.com/sevecek/OpenSPH)（SPH / N-body 天体物理模拟器）移植到鸿蒙电脑端（HarmonyOS PC / 2in1），
+> 产品名：**宇宙工坊**（Cosmic Atelier）　物理内核：OpenSPH　功能方向：对标 SpaceSim
+>
+> 宇宙工坊是面向鸿蒙电脑的天体撞击与演化模拟应用：设定初始条件，跑一次模拟，得到影像。
+> OpenSPH 是上游开源项目，也是本项目的物理内核与 MIT 许可来源；**宇宙工坊是独立品牌**。
+
+把上游 [OpenSPH](https://github.com/pavelsevecek/OpenSPH)（SPH / N-body 天体物理模拟器）移植到鸿蒙电脑端（HarmonyOS PC / 2in1），
 界面层用 **ArkTS / ArkUI 完全重写**，物理内核沿用 OpenSPH 上游 C++ 代码，通过 N-API 桥接。
 
 > 本仓库只包含**界面与桥接层源码**。上游 OpenSPH 内核、wxWidgets/Qt 移植层与预编译 `.so` 不在此仓库中，

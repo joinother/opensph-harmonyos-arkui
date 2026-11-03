@@ -1,4 +1,4 @@
-# OpenSPH 鸿蒙 ArkUI 版 · 全功能遍历测试报告
+# 宇宙工坊 · 全功能遍历测试报告
 
 - 被测包：`com.opensph.app`（ArkAbility，ArkUI 界面）
 - 设备：HUAWEI HAD-W32（2in1），API 26，hdc over TCP
