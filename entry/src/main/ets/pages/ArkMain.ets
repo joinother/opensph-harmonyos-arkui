@@ -281,6 +281,7 @@ function zoomBtn() {
     hovered: { .backgroundColor('#f2f4f7') },
     pressed: { .backgroundColor('#e6effd') }
   })
+  .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
 }
 
 @Extend(Text)
@@ -288,6 +289,7 @@ function menuStyle() {
   .fontSize(14)
   .fontColor('#1f2328')
   .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+  .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
   .borderRadius(6)
   .stateStyles({
     normal: { .backgroundColor(Color.Transparent) },
@@ -3399,6 +3401,7 @@ struct ArkMain {
                 .onHover((isHover: boolean) => {
                   const key: string = group + '/' + label;
                   this.hoverPanel = isHover ? key : (this.hoverPanel === key ? '' : this.hoverPanel);
+                  if (isHover) { CursorUtil.hand(); } else { CursorUtil.reset(); }
                 })
                 .onClick(() => {
                   this.runMenuAction(group, index);
@@ -3488,6 +3491,7 @@ struct ArkMain {
           : (this.hoverTop === item ? '#eef3fd' : Color.Transparent))
         .onHover((isHover: boolean) => {
           this.hoverTop = isHover ? item : (this.hoverTop === item ? '' : this.hoverTop);
+          if (isHover) { CursorUtil.hand(); } else { CursorUtil.reset(); }
           hilog.info(0x0000, 'OpenSPHHover', `${item} hover=${isHover} state=${this.hoverTop}`);
           if (isHover) {
             this.menuHoverKeep = true;
@@ -3559,6 +3563,7 @@ struct ArkMain {
                       hovered: { .backgroundColor('#eceff3') },
                       pressed: { .backgroundColor('#e6effd') }
                     })
+                    .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
                 }
                 .onClick(() => {
                   this.addNode(item);
@@ -3630,9 +3635,11 @@ struct ArkMain {
         Row({ space: 2 }) {
           Text('＋')
             .zoomBtn()
+            .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
             .onClick(() => { this.zoom = Math.min(2.5, Math.round((this.zoom + 0.15) * 100) / 100); });
           Text('－')
             .zoomBtn()
+            .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
             .onClick(() => { this.zoom = Math.max(0.4, Math.round((this.zoom - 0.15) * 100) / 100); });
           Text(`${Math.round(this.zoom * 100)}%`)
             .fontSize(11)
@@ -3949,6 +3956,9 @@ struct ArkMain {
         .animation({ duration: 0 })
         .gesture(
           PanGesture({ fingers: 1, distance: 12 })
+            .onActionStart(() => {
+              CursorUtil.grabbing();
+            })
             .onActionUpdate((event: GestureEvent) => {
               this.panX += event.offsetX - this.lastPanX;
               this.panY += event.offsetY - this.lastPanY;
@@ -3958,6 +3968,7 @@ struct ArkMain {
             .onActionEnd(() => {
               this.lastPanX = 0;
               this.lastPanY = 0;
+              CursorUtil.grab();
             })
         )
       }
@@ -4094,6 +4105,7 @@ struct ArkMain {
           Row({ space: 4 }) {
             ForEach([0, 1, 2], (i: number) => {
               TextInput({ text: this.numAt(entry, i) })
+                .onHover((h: boolean) => { if (h) { CursorUtil.text(); } else { CursorUtil.reset(); } })
                 .type(InputType.NUMBER_DECIMAL)
                 .fontSize(11)
                 .width(58)
@@ -4134,6 +4146,7 @@ struct ArkMain {
           Row({ space: 4 }) {
             ForEach([0, 1], (i: number) => {
               TextInput({ text: this.numAt(entry, i) })
+                .onHover((h: boolean) => { if (h) { CursorUtil.text(); } else { CursorUtil.reset(); } })
                 .type(InputType.NUMBER_DECIMAL)
                 .fontSize(11)
                 .width(64)
@@ -4172,6 +4185,7 @@ struct ArkMain {
           }
         } else if (entry.type === 'bool') {
           Toggle({ type: ToggleType.Switch, isOn: entry.value === true })
+            .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
             .selectedColor('#0b57d0')
             .onChange((isOn: boolean) => {
               this.applySetting(entry, isOn ? 'true' : 'false');
@@ -4191,6 +4205,7 @@ struct ArkMain {
             })
         } else if (entry.type === 'int' || entry.type === 'float') {
           TextInput({ text: this.valueText(entry) })
+            .onHover((h: boolean) => { if (h) { CursorUtil.text(); } else { CursorUtil.reset(); } })
             .type(entry.type === 'float' ? InputType.NUMBER_DECIMAL : InputType.Number)
             .fontSize(12)
             .width(96)
@@ -4777,6 +4792,15 @@ struct ArkMain {
           .layoutWeight(1)
           .backgroundColor((this.exportRunning) ? '#b9c6da' : '#0b57d0')
           .enabled(!this.exportRunning)
+          .onHover((h: boolean) => {
+            if (!h) {
+              CursorUtil.reset();
+            } else if (this.exportRunning) {
+              CursorUtil.forbid();
+            } else {
+              CursorUtil.hand();
+            }
+          })
           .onClick(() => {
             if (this.exportMode === 1) {
               if (this.recording) {
@@ -5023,6 +5047,7 @@ struct NodeCard {
               hovered: { .backgroundColor('#eceff3') },
               pressed: { .backgroundColor('#e6effd') }
             })
+            .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
             .onClick(() => {
               this.onContextMenu(this.node.id, 0, 0);
             })
@@ -5039,6 +5064,7 @@ struct NodeCard {
               hovered: { .backgroundColor('#f0d6d6') },
               pressed: { .backgroundColor('#f3c9c9') }
             })
+            .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
             .onClick(() => {
               this.onRemove(this.node.id);
             })

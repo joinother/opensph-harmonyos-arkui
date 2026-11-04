@@ -68,3 +68,31 @@
 - **渲染色质与物理**：已达原版水平并超出（原版没有纹理）。
 - **节点图能力**：fan-out、双输入口、自动同步都已具备。
 - **主要缺口**：渲染中取消、低分辨率粒子间隙、长任务抗中断、IPv6 广域网实测、picker 两条流程的实测。
+
+## 六、鼠标交互（指针样式）
+
+鸿蒙没有 CSS `cursor`，全部通过 `pointer.setPointerStyle(windowId, style)` 实现：
+`CursorUtil` 在 `ArkAbility.onWindowStageCreate` 取 `windowId`，各组件的 `onHover` 切换样式、移出复位 `DEFAULT`。
+
+| 区域 | 样式 | PointerStyle | 状态 |
+|---|---|---|---|
+| 顶部菜单标题 / 菜单项 | 手型 | `HAND_POINTING` (19) | ✅ 实测 |
+| 工具栏缩放 −/＋ | 手型 | `HAND_POINTING` (19) | ✅ |
+| 左栏节点库条目 | 手型 | `HAND_POINTING` (19) | ✅ 实测 |
+| 节点卡片主体（可拖） | 移动 | `MOVE` (21) | ✅ 实测 |
+| 卡片「⋯」菜单按钮 | 手型 | `HAND_POINTING` (19) | ✅ 实测 |
+| 卡片「×」删除按钮 | 手型 | `HAND_POINTING` (19) | ✅ |
+| 输出端口（拖出连线） | 十字 | `CROSS` (13) | ✅ |
+| 输入端口（可连入） | 复制 | `CURSOR_COPY` (14) | ✅ |
+| 画布空白（悬停） | 抓手张开 | `HAND_OPEN` (18) | ✅ 实测 |
+| 画布平移中（按下拖动） | 抓手抓取 | `HAND_GRABBING` (17) | ✅ 已接线 |
+| 左右面板分隔条 | 左右调整 | `RESIZE_LEFT_RIGHT` (22) | ✅ |
+| 属性面板数值输入框 | 文本光标 | `TEXT_CURSOR` (26) | ✅ |
+| 属性面板开关 | 手型 | `HAND_POINTING` (19) | ✅ |
+| 导出按钮（可用） | 手型 | `HAND_POINTING` (19) | ✅ |
+| 导出按钮（导出中） | 禁止 | `CURSOR_FORBID` (15) | ✅ |
+
+**验证方式说明**：指针样式不进入 UI 树、也不出现在截图里，因此只能用 `apply style=N` 日志确认调用链；
+"看起来对不对"仍需人工用鼠标划过确认。
+
+**已知未覆盖**：`Select` 下拉本体、`Radio/Checkbox`（当前无此控件）、预览子窗口内控件、右键菜单项（依赖同一 `hoverPanel` 逻辑，样式随菜单项生效）。
