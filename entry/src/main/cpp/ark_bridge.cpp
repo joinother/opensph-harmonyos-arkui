@@ -1695,6 +1695,76 @@ napi_value buildRochePreset(napi_env env, napi_callback_info) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 导出「设置目录」：遍历全部已注册作业，实例化后枚举每个设置项的名称与枚举选项，
+// 分块打到 hilog（每条 <600 字符），供离线做汉化差集。
+// 只在需要时调用（临时诊断用），不参与正常运行。
+// ---------------------------------------------------------------------------
+napi_value dumpSettingCatalog(napi_env env, napi_callback_info) {
+    registerCoreJobs();
+    std::vector<std::string> lines;
+    for (const AutoPtr<IJobDesc>& desc : enumerateRegisteredJobs()) {
+        if (!desc) {
+            continue;
+        }
+        const std::string cls = desc->className().toUtf8().cstr();
+        try {
+            AutoPtr<IJob> job = desc->create(NOTHING);
+            if (!job) {
+                continue;
+            }
+            SharedPtr<JobNode> node = makeShared<JobNode>(std::move(job));
+            VirtualSettings settings = node->getSettings();
+            class CatalogProc : public VirtualSettings::IEntryProc {
+            public:
+                const std::string cls;
+                std::vector<std::string>& out;
+                mutable std::string category;
+                explicit CatalogProc(const std::string& c, std::vector<std::string>& o)
+                    : cls(c), out(o) {}
+                virtual void onCategory(const String& name) const override {
+                    category = name.toUtf8().cstr();
+                }
+                virtual void onEntry(const String& key, IVirtualEntry& entry) const override {
+                    const auto type = entry.getType();
+                    if (type == IVirtualEntry::Type::EXTRA) {
+                        return;
+                    }
+                    std::string line = "S|" + cls + "|" + category + "|" + key.toUtf8().cstr();
+                    if (type == IVirtualEntry::Type::ENUM) {
+                        // 只记当前枚举数值；选项文本由 nodeSettings JSON 提供，这里不重复
+                        line += "|" + std::to_string(entry.get().get<EnumWrapper>().value);
+                    }
+                    out.push_back(line);
+                }
+            };
+            CatalogProc proc(cls, lines);
+            settings.enumerate(proc);
+        } catch (const std::exception& e) {
+            lines.push_back("E|" + cls + "|" + std::string(e.what()));
+        }
+    }
+    // 分块输出：每块若干行，块首带序号
+    std::string chunk;
+    int index = 0;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (!chunk.empty()) {
+            chunk += "\n";
+        }
+        chunk += lines[i];
+        if (chunk.size() > 550 || i + 1 == lines.size()) {
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHCat",
+                "[%{public}d]%{public}s", index, chunk.c_str());
+            index += 1;
+            chunk.clear();
+        }
+    }
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHCat",
+        "done lines=%{public}zu chunks=%{public}d", lines.size(), index);
+    return makeString(env, "{\"ok\":true,\"lines\":" + std::to_string(lines.size()) + "}");
+}
+
 napi_value createNode(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1];
@@ -2960,6 +3030,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"jobCatalog", nullptr, jobCatalog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"createNode", nullptr, createNode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"buildRochePreset", nullptr, buildRochePreset, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"dumpSettingCatalog", nullptr, dumpSettingCatalog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"nodeSettings", nullptr, nodeSettings, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setNodeSetting", nullptr, setNodeSetting, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"releaseNode", nullptr, releaseNode, nullptr, nullptr, nullptr, napi_default, nullptr},

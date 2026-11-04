@@ -13,6 +13,7 @@ import common from '@ohos.app.ability.common';
 import fs from '@ohos.file.fs';
 import image from '@ohos.multimedia.image';
 import picker from '@ohos.file.picker';
+import { CursorUtil } from '../common/CursorUtil';
 import { RemoteServer, RemoteReply, RemoteRequest } from '../common/RemoteServer';
 import { SystemNotifier } from '../common/SystemNotifier';
 
@@ -871,6 +872,7 @@ struct ArkMain {
   aboutToAppear(): void {
     this.loadMotionPref();
     setTimeout(() => { this.uploadTexture(this.textureKind); }, 1200);
+    setTimeout(() => { this.dumpAllSettingNames(); }, 2500);
     this.readSystemMotionPref();
     this.calcPaneListHeight();
     this.loadPaneWidths();
@@ -1254,6 +1256,47 @@ struct ArkMain {
     this.linkVersion += 1;
     hilog.info(0x0000, 'OpenSPHSync',
       `kernel nodes=${g.nodes.length} links=${g.links.length} addedNodes=${added.length} addedLinks=${newLinks.length}`);
+  }
+
+  // 临时诊断：遍历全部已注册作业，导出每个设置项的「显示名」与分类名，
+  // 用于与 I18nZh 的中文表做差集（SETTING_LABELS 的键就是显示名）。
+  private dumpAllSettingNames(): void {
+    interface JobItem {
+      className: string;
+      category: string;
+    }
+    let jobs: JobItem[] = [];
+    try {
+      jobs = JSON.parse(String(ark.jobCatalog())) as JobItem[];
+    } catch (e) {
+      hilog.warn(0x0000, 'OpenSPHCat', 'listJobs failed');
+      return;
+    }
+    let count = 0;
+    for (const job of jobs) {
+      let handle: number = -1;
+      try {
+        handle = Number(ark.createNode(job.className));
+      } catch (e) {
+        continue;
+      }
+      if (handle < 0) {
+        continue;
+      }
+      try {
+        const cats: SettingCategory[] = JSON.parse(String(ark.nodeSettings(handle))) as SettingCategory[];
+        for (const cat of cats) {
+          hilog.info(0x0000, 'OpenSPHCat', `C|${job.className}|${cat.category}`);
+          for (const e of cat.entries) {
+            hilog.info(0x0000, 'OpenSPHCat', `N|${job.className}|${cat.category}|${e.name}|${e.key}`);
+            count += 1;
+          }
+        }
+      } catch (e) {
+        // 忽略
+      }
+    }
+    hilog.info(0x0000, 'OpenSPHCat', `done count=${count} jobs=${jobs.length}`);
   }
 
   private startSimExportVideo(): void {
@@ -3923,6 +3966,14 @@ struct ArkMain {
     .height('100%')
     .backgroundColor('#f5f6f8')
     .clip(true)
+    .onHover((h: boolean) => {
+      // 画布空白可按住平移：显示「抓手」
+      if (h) {
+        CursorUtil.grab();
+      } else {
+        CursorUtil.reset();
+      }
+    })
     .onClick(() => {
       if (this.ctxNode >= 0) {
         this.ctxNode = -1;
@@ -4772,7 +4823,14 @@ struct ArkMain {
             .height('100%')
             .backgroundColor(this.dragSide === 1 ? '#0b57d0'
               : (this.hoverDivider === 1 ? '#c3c8cf' : '#eceff3'))
-            .onHover((h: boolean) => { this.hoverDivider = h ? 1 : (this.hoverDivider === 1 ? 0 : this.hoverDivider); })
+            .onHover((h: boolean) => {
+              this.hoverDivider = h ? 1 : (this.hoverDivider === 1 ? 0 : this.hoverDivider);
+              if (h) {
+                CursorUtil.resizeH();
+              } else if (this.hoverDivider === 0) {
+                CursorUtil.reset();
+              }
+            })
             .gesture(
               PanGesture({ fingers: 1, distance: 1 })
                 .onActionStart(() => { this.dragSide = 1; })
@@ -4795,7 +4853,14 @@ struct ArkMain {
             .height('100%')
             .backgroundColor(this.dragSide === 2 ? '#0b57d0'
               : (this.hoverDivider === 2 ? '#c3c8cf' : '#eceff3'))
-            .onHover((h: boolean) => { this.hoverDivider = h ? 2 : (this.hoverDivider === 2 ? 0 : this.hoverDivider); })
+            .onHover((h: boolean) => {
+              this.hoverDivider = h ? 2 : (this.hoverDivider === 2 ? 0 : this.hoverDivider);
+              if (h) {
+                CursorUtil.resizeH();
+              } else if (this.hoverDivider === 0) {
+                CursorUtil.reset();
+              }
+            })
             .gesture(
               PanGesture({ fingers: 1, distance: 1 })
                 .onActionStart(() => { this.dragSide = 2; })
@@ -5019,11 +5084,17 @@ struct NodeCard {
         .stroke('#8ab4f8')
         .strokeWidth(2)
         .offset({ x: -PORT_R })
+        .onHover((h: boolean) => {
+          if (h) { CursorUtil.dropTarget(); } else { CursorUtil.reset(); }
+        })
 
       // 输出端口（右）+ 拖拽连线
       Circle({ width: PORT_R * 2, height: PORT_R * 2 })
         .fill('#8ab4f8')
         .offset({ x: CARD_W - PORT_R })
+        .onHover((h: boolean) => {
+          if (h) { CursorUtil.link(); } else { CursorUtil.reset(); }
+        })
         .gesture(
           PanGesture({ fingers: 1, direction: PanDirection.All, distance: 0 })
             .onActionStart(() => {
@@ -5041,6 +5112,13 @@ struct NodeCard {
     .height(CARD_H)
     .margin({ left: -PORT_R })
     .position({ x: this.node.x, y: this.node.y })
+    .onHover((isHover: boolean) => {
+      if (isHover) {
+        CursorUtil.move();
+      } else {
+        CursorUtil.reset();
+      }
+    })
     .onMouse((event: MouseEvent) => {
       if (event.action === MouseAction.Press) {
         hilog.info(0x0000, 'OpenSPHMouse', `card mouse button=${event.button} xy=${event.x},${event.y}`);
