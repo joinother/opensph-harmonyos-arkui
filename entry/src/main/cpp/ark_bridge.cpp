@@ -2487,6 +2487,8 @@ struct SimState {
     double time = 0;
     long long steps = 0;
     size_t particles = 0;
+    int setUpCount = 0;        // onSetUp 被调用次数（诊断 IC 是否求值）
+    int timeStepCount = 0;     // onTimeStep 被调用次数
     // 内核统计量（原先只取 RUN_TIME，这里补齐）
     double wallclock = 0;
     double progress = 0;
@@ -2531,6 +2533,7 @@ public:
     virtual void onSetUp(const Storage& storage, Statistics& stats) override {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.particles = storage.getParticleCnt();
+        state.setUpCount += 1;
         if (stats.has(StatisticsId::RUN_TIME)) {
             state.time = double(stats.get<Float>(StatisticsId::RUN_TIME));
         }
@@ -2540,6 +2543,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.steps += 1;
+            state.timeStepCount += 1;
             state.particles = storage.getParticleCnt();
             if (stats.has(StatisticsId::RUN_TIME)) {
                 state.time = double(stats.get<Float>(StatisticsId::RUN_TIME));
@@ -3256,6 +3260,10 @@ napi_value simulationStatus(napi_env env, napi_callback_info) {
         ",\"sphEval\":%.6g,\"gravBuild\":%.6g",
         st.wallclock, st.progress, st.eta, st.dt, st.dtElapsed, st.sphEval, st.gravBuild);
     json += sbuf;
+    char dbuf[128];
+    std::snprintf(dbuf, sizeof(dbuf), ",\"setUpCount\":%d,\"timeStepCount\":%d",
+        st.setUpCount, st.timeStepCount);
+    json += dbuf;
     json += ",\"recording\":";
     json += st.recActive.load() ? "true" : "false";
     json += ",\"recFrames\":" + std::to_string(st.recFrames);

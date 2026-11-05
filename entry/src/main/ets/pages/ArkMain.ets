@@ -388,6 +388,8 @@ struct ArkMain {
   @State private stDone: boolean = false;
   @State private stOk: boolean = false;
   @State private stError: string = '';
+  @State private stSetUp: number = 0;
+  @State private stTimeSteps: number = 0;
   private statSeries: number[] = [];
   private statCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private pinchStartZoom: number = 1;
@@ -2281,6 +2283,8 @@ interface Probe {
         particles: number;
         recording: boolean;
         recFrames: number;
+        setUpCount?: number;
+        timeStepCount?: number;
         wallclock?: number;
         progress?: number;
         eta?: number;
@@ -2311,6 +2315,8 @@ interface Probe {
       this.stDone = st.done;
       this.stOk = st.ok;
       this.stError = st.error !== undefined ? st.error : '';
+      this.stSetUp = st.setUpCount !== undefined ? st.setUpCount : 0;
+      this.stTimeSteps = st.timeStepCount !== undefined ? st.timeStepCount : 0;
       this.stWall = st.wallclock !== undefined ? st.wallclock : 0;
       this.stProgress = st.progress !== undefined ? st.progress : 0;
       this.stEta = st.eta !== undefined ? st.eta : 0;
@@ -4040,6 +4046,7 @@ interface Probe {
           this.statChip('时间步', this.stDt.toExponential(2));
           this.statChip('粒子', String(this.stParticles));
           this.statChip('步数', String(this.stSteps));
+          this.statChip('初始化', `${this.stSetUp}/${this.stTimeSteps}`);
         }
         .width('100%')
         .padding({ left: 10, right: 10, bottom: 4 });
