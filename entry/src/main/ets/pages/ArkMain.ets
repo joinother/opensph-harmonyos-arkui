@@ -375,6 +375,17 @@ struct ArkMain {
   private cardDragging: boolean = false;
   // 会话隔离：每个窗口一个 sessionId，内核据此隔离节点表/贴图/天体表
   private sid: number = 0;
+  // 运行状态面板（内核统计量 + 曲线）
+  @State private statVisible: boolean = true;
+  @State private stTime: number = 0;
+  @State private stProgress: number = 0;
+  @State private stWall: number = 0;
+  @State private stEta: number = 0;
+  @State private stDt: number = 0;
+  @State private stParticles: number = 0;
+  @State private stSteps: number = 0;
+  private statSeries: number[] = [];
+  private statCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private pinchStartZoom: number = 1;
   private twoFingerPanX: number = 0;
   private twoFingerPanY: number = 0;
@@ -2267,6 +2278,13 @@ interface Probe {
         particles: number;
         recording: boolean;
         recFrames: number;
+        wallclock?: number;
+        progress?: number;
+        eta?: number;
+        dt?: number;
+        dtElapsed?: number;
+        sphEval?: number;
+        gravBuild?: number;
         error?: string;
       }
       let st: SimStatus | null = null;
@@ -2282,6 +2300,21 @@ interface Probe {
       this.simRunning = st.running;
       this.simPaused = st.paused;
       this.simTime = st.time;
+      // 运行状态面板
+      this.stTime = st.time;
+      this.stSteps = st.steps;
+      this.stParticles = st.particles;
+      this.stWall = st.wallclock !== undefined ? st.wallclock : 0;
+      this.stProgress = st.progress !== undefined ? st.progress : 0;
+      this.stEta = st.eta !== undefined ? st.eta : 0;
+      this.stDt = st.dt !== undefined ? st.dt : 0;
+      if (st.particles > 0) {
+        this.statSeries = this.statSeries.concat([st.particles]);
+        if (this.statSeries.length > 120) {
+          this.statSeries = this.statSeries.slice(this.statSeries.length - 120);
+        }
+        this.drawStatCurve();
+      }
       this.simSteps = st.steps;
       this.simParticles = st.particles;
       // 运行中且停在预览页签时，实时刷新粒子快照
@@ -3968,6 +4001,89 @@ interface Probe {
       })
   }
 
+  // 运行状态面板：显示内核统计量，并画出粒子数/时间步曲线
+  @Builder
+  statPanel() {
+    Column() {
+      Row() {
+        Text('运行状态').fontSize(11).fontWeight(FontWeight.Medium).fontColor('#5f6670');
+        Blank();
+        Text(this.statVisible ? '收起' : '展开').fontSize(10).fontColor('#0b57d0')
+          .onClick(() => { this.statVisible = !this.statVisible; });
+      }
+      .width('100%')
+      .padding({ left: 10, right: 10, top: 4, bottom: 2 });
+
+      if (this.statVisible) {
+        Row({ space: 14 }) {
+          this.statChip('时间 [s]', this.stTime.toFixed(3));
+          this.statChip('进度', `${(this.stProgress * 100).toFixed(1)}%`);
+          this.statChip('墙钟 [s]', this.stWall.toFixed(1));
+          this.statChip('剩余 [s]', this.stEta > 0 ? this.stEta.toFixed(0) : '—');
+          this.statChip('时间步', this.stDt.toExponential(2));
+          this.statChip('粒子', String(this.stParticles));
+          this.statChip('步数', String(this.stSteps));
+        }
+        .width('100%')
+        .padding({ left: 10, right: 10, bottom: 4 });
+
+        Canvas(this.statCtx)
+          .width('100%')
+          .height(46)
+          .onReady(() => { this.drawStatCurve(); });
+      }
+    }
+    .width('100%')
+    .backgroundColor('#ffffff')
+    .border({ width: { top: 1 }, color: '#e4e7eb' });
+  }
+
+  @Builder
+  statChip(label: string, value: string) {
+    Column() {
+      Text(label).fontSize(9).fontColor('#8b929b');
+      Text(value).fontSize(11).fontColor('#1f2328');
+    }
+    .alignItems(HorizontalAlign.Start);
+  }
+
+  private drawStatCurve(): void {
+    const w: number = this.statCtx.width;
+    const h: number = this.statCtx.height;
+    if (w <= 0 || h <= 0) {
+      return;
+    }
+    this.statCtx.clearRect(0, 0, w, h);
+    this.statCtx.fillStyle = '#fbfcfd';
+    this.statCtx.fillRect(0, 0, w, h);
+    const n: number = this.statSeries.length;
+    if (n < 2) {
+      this.statCtx.fillStyle = '#b0b6be';
+      this.statCtx.font = '10px sans-serif';
+      this.statCtx.fillText('运行后显示粒子数曲线', 8, h / 2 + 3);
+      return;
+    }
+    let mx: number = 1;
+    for (const v of this.statSeries) {
+      if (v > mx) {
+        mx = v;
+      }
+    }
+    this.statCtx.strokeStyle = '#0b57d0';
+    this.statCtx.lineWidth = 1.5;
+    this.statCtx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x: number = (i / (n - 1)) * (w - 8) + 4;
+      const y: number = h - 4 - (this.statSeries[i] / mx) * (h - 10);
+      if (i === 0) {
+        this.statCtx.moveTo(x, y);
+      } else {
+        this.statCtx.lineTo(x, y);
+      }
+    }
+    this.statCtx.stroke();
+  }
+
   @Builder
   canvasTabs() {
     Row({ space: 4 }) {
@@ -5319,6 +5435,7 @@ interface Probe {
         Column() {
           this.canvasTabs()
           this.canvasPane()
+          this.statPanel()
         }
         .layoutWeight(1)
         .height('100%')

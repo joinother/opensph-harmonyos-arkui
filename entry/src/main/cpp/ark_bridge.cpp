@@ -2487,6 +2487,15 @@ struct SimState {
     double time = 0;
     long long steps = 0;
     size_t particles = 0;
+    // 内核统计量（原先只取 RUN_TIME，这里补齐）
+    double wallclock = 0;
+    double progress = 0;
+    double eta = 0;
+    double dt = 0;
+    double dtElapsed = 0;
+    double neighborMin = 0, neighborMax = 0, neighborMean = 0;
+    double sphEval = 0, gravBuild = 0;
+    long long gravNodes = 0, gravExact = 0;
     std::string error;
     std::mutex mutex;
     // 模拟录制
@@ -2534,6 +2543,28 @@ public:
             state.particles = storage.getParticleCnt();
             if (stats.has(StatisticsId::RUN_TIME)) {
                 state.time = double(stats.get<Float>(StatisticsId::RUN_TIME));
+            }
+            // 其余统计量：全部用 has() 保护，缺了就保持旧值
+            if (stats.has(StatisticsId::WALLCLOCK_TIME)) {
+                state.wallclock = double(stats.get<Float>(StatisticsId::WALLCLOCK_TIME));
+            }
+            if (stats.has(StatisticsId::RELATIVE_PROGRESS)) {
+                state.progress = double(stats.get<Float>(StatisticsId::RELATIVE_PROGRESS));
+            }
+            if (stats.has(StatisticsId::ETA)) {
+                state.eta = double(stats.get<Float>(StatisticsId::ETA));
+            }
+            if (stats.has(StatisticsId::TIMESTEP_VALUE)) {
+                state.dt = double(stats.get<Float>(StatisticsId::TIMESTEP_VALUE));
+            }
+            if (stats.has(StatisticsId::TIMESTEP_ELAPSED)) {
+                state.dtElapsed = double(stats.get<Float>(StatisticsId::TIMESTEP_ELAPSED));
+            }
+            if (stats.has(StatisticsId::SPH_EVAL_TIME)) {
+                state.sphEval = double(stats.get<Float>(StatisticsId::SPH_EVAL_TIME));
+            }
+            if (stats.has(StatisticsId::GRAVITY_BUILD_TIME)) {
+                state.gravBuild = double(stats.get<Float>(StatisticsId::GRAVITY_BUILD_TIME));
             }
         }
         while (state.pauseRequested.load() && !state.abortRequested.load()) {
@@ -3195,6 +3226,13 @@ napi_value simulationStatus(napi_env env, napi_callback_info) {
         st.steps,
         st.particles);
     std::string json(buf);
+    // 内核统计量：一次性暴露给界面（运行状态面板与曲线图用）
+    char sbuf[512];
+    std::snprintf(sbuf, sizeof(sbuf),
+        ",\"wallclock\":%.6g,\"progress\":%.6g,\"eta\":%.6g,\"dt\":%.6g,\"dtElapsed\":%.6g"
+        ",\"sphEval\":%.6g,\"gravBuild\":%.6g",
+        st.wallclock, st.progress, st.eta, st.dt, st.dtElapsed, st.sphEval, st.gravBuild);
+    json += sbuf;
     json += ",\"recording\":";
     json += st.recActive.load() ? "true" : "false";
     json += ",\"recFrames\":" + std::to_string(st.recFrames);
