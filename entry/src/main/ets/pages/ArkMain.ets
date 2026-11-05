@@ -2008,6 +2008,38 @@ ${circles}
     }
   }
 
+  // 网格导出：等值面 → obj / ply（走系统保存面板）
+  private async exportMeshFile(ext: string): Promise<void> {
+    const handle: number = this.selectedNode >= 0 ? (this.nodeById(this.selectedNode)?.handle ?? -1) : -1;
+    if (handle < 0) {
+      this.noticeService.warn('无法导出网格', '先选中一个节点');
+      return;
+    }
+    try {
+      const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+      opts.newFileNames = [`网格-${Date.now()}.${ext}`];
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const pickerInst: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+      const uris: string[] = await pickerInst.save(opts);
+      if (uris.length === 0) {
+        return;
+      }
+      interface MeshResult {
+        ok: boolean;
+        triangles?: number;
+        error?: string;
+      }
+      const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, uris[0], 0.6))) as MeshResult;
+      if (!res.ok) {
+        this.noticeService.error('导出网格失败', res.error ?? '');
+        return;
+      }
+      this.noticeService.success('网格已导出', `${res.triangles ?? 0} 个三角面（.${ext}）`);
+    } catch (e) {
+      this.noticeService.error('导出网格失败', String(e));
+    }
+  }
+
   private async saveVideoToUser(devicePath: string, name: string): Promise<void> {
     try {
       const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
@@ -4775,6 +4807,10 @@ ${circles}
           .onClick(() => { this.exportStillPng(); });
         Button('SVG').fontSize(11).height(28)
           .onClick(() => { this.exportStillSvg(); });
+        Button('网格 OBJ').fontSize(11).height(28)
+          .onClick(() => { this.exportMeshFile('obj'); });
+        Button('网格 PLY').fontSize(11).height(28)
+          .onClick(() => { this.exportMeshFile('ply'); });
       }
       .position({ x: 300, y: 10 })
       .zIndex(9);

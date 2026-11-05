@@ -27,6 +27,10 @@
 #include "gui/objects/Color.h"
 #include "gui/objects/VideoWriter.h"
 #include "io/Path.h"
+#include "post/MarchingCubes.h"
+#include "post/MeshFile.h"
+#include "system/Factory.h"
+#include "system/Factory.h"
 #include "run/Job.h"
 #include "run/Config.h"
 #include <hilog/log.h>
@@ -788,6 +792,119 @@ napi_value paletteSample(napi_env env, napi_callback_info info) {
     return makeString(env, buf);
 }
 
+
+
+// 前向声明（定义在本文件后部）
+bool sampleNodePoints(const int handle, const int maxPoints, std::vector<float>& points, std::string& error);
+
+// ---- 等值面网格导出（MarchingCubes + obj/ply） ----
+namespace {
+class CloudField : public IScalarField {
+private:
+    std::vector<Vector> pts;
+    double radius = 1.0;
+public:
+    CloudField(std::vector<Vector> p, const double r) : pts(std::move(p)), radius(r) {}
+    virtual Float operator()(const Vector& pos) override {
+        // 简化密度场：对邻近粒子做平滑核求和，阈值由 surfaceLevel 决定
+        double sum = 0;
+        const double r2 = radius * radius;
+        for (const Vector& p : pts) {
+            const Vector d = pos - p;
+            const double q2 = dot(d, d);
+            if (q2 < r2) {
+                const double q = 1.0 - q2 / r2;
+                sum += q * q * q;
+            }
+        }
+        return Float(sum);
+    }
+};
+}  // namespace
+
+napi_value exportMesh(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t handle = -1;
+    napi_get_value_int32(env, argv[0], &handle);
+    char pathBuf[1024] = { 0 };
+    size_t pathLen = 0;
+    napi_get_value_string_utf8(env, argv[1], pathBuf, sizeof(pathBuf) - 1, &pathLen);
+    double isoLevel = 0.5;
+    if (argc >= 3) { napi_get_value_double(env, argv[2], &isoLevel); }
+
+    const auto it = nodeRegistry().find(handle);
+    if (it == nodeRegistry().end()) {
+        return makeString(env, "{\"ok\":false,\"error\":\"节点不存在\"}");
+    }
+    std::vector<float> coords;
+    std::string sErr;
+    if (!sampleNodePoints(handle, 3000, coords, sErr)) {
+        return makeString(env, "{\"ok\":false,\"error\":\"" + jsonEscape(String::fromUtf8(sErr.c_str())) + "\"}");
+    }
+    if (coords.size() < 9) {
+        return makeString(env, "{\"ok\":false,\"error\":\"该节点没有足够的粒子\"}");
+    }
+    // 求包围盒与平均间距
+    double mn[3] = { 1e300, 1e300, 1e300 }, mx[3] = { -1e300, -1e300, -1e300 };
+    std::vector<Vector> pts;
+    const size_t n = coords.size() / 3;
+    pts.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const Vector v(coords[i * 3], coords[i * 3 + 1], coords[i * 3 + 2]);
+        pts.push_back(v);
+        for (int k = 0; k < 3; ++k) {
+            mn[k] = std::min(mn[k], double(v[k]));
+            mx[k] = std::max(mx[k], double(v[k]));
+        }
+    }
+    const double sizeX = mx[0] - mn[0], sizeY = mx[1] - mn[1], sizeZ = mx[2] - mn[2];
+    const double ext = std::max(std::max(sizeX, sizeY), sizeZ);
+    const double radius = std::max(ext * 0.06, 1e-6);
+    const Vector center(0.5 * (mn[0] + mx[0]), 0.5 * (mn[1] + mx[1]), 0.5 * (mn[2] + mx[2]));
+    const double half = 0.5 * ext + radius;
+
+    SharedPtr<IScalarField> field = makeShared<CloudField>(pts, radius);
+    // 自动标定等值面阈值：在包围盒内抽样估计场值量级，取峰值的 35%
+    double peak = 0;
+    {
+        unsigned long long st2 = 0x9E3779B97F4A7C15ull;
+        auto rnd = [&st2]() {
+            st2 ^= st2 << 13; st2 ^= st2 >> 7; st2 ^= st2 << 17;
+            return double(st2 % 1000000) / 1000000.0;
+        };
+        for (int k = 0; k < 400; ++k) {
+            const Vector p(center[0] + (rnd() - 0.5) * 2 * half,
+                           center[1] + (rnd() - 0.5) * 2 * half,
+                           center[2] + (rnd() - 0.5) * 2 * half);
+            peak = std::max(peak, double((*field)(p)));
+        }
+    }
+    double iso = isoLevel;
+    if (iso <= 0.0 || iso > peak) {
+        iso = std::max(0.08, peak * 0.35);   // 用户值不合理时自动标定
+    }
+    SharedPtr<IScheduler> sched = Factory::getScheduler();
+    MarchingCubes mc(*sched, Float(iso), field);
+    try {
+        // 网格分辨率取包围盒尺寸的 1/48，兼顾速度与细节
+        mc.addComponent(Box(center - Vector(half), center + Vector(half)), Float(2.0 * half / 64.0));
+    } catch (const std::exception& e) {
+        return makeString(env, "{\"ok\":false,\"error\":\"等值面生成失败：" +
+            jsonEscape(String::fromUtf8(e.what())) + "\"}");
+    }
+    Array<Triangle>& triRef = mc.getTriangles();
+    AutoPtr<IMeshFile> writer = getMeshFile(Path(String::fromUtf8(pathBuf)));
+    if (writer == nullptr) {
+        return makeString(env, "{\"ok\":false,\"error\":\"不支持该网格格式\"}");
+    }
+    const Outcome res = writer->save(Path(String::fromUtf8(pathBuf)), triRef);
+    if (!res) {
+        return makeString(env, "{\"ok\":false,\"error\":\"写入网格失败\"}");
+    }
+    return makeString(env, "{\"ok\":true,\"triangles\":" + std::to_string(triRef.size()) + "}");
+}
 
 napi_value setFilmic(napi_env env, napi_callback_info info) {
     size_t argc = 3;
@@ -3519,6 +3636,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"setSession", nullptr, setSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setPalette", nullptr, setPalette, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setFilmic", nullptr, setFilmic, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"exportMesh", nullptr, exportMesh, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"paletteSample", nullptr, paletteSample, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dumpSettingCatalog", nullptr, dumpSettingCatalog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"nodeSettings", nullptr, nodeSettings, nullptr, nullptr, nullptr, napi_default, nullptr},
