@@ -2240,6 +2240,39 @@ interface Probe {
     }
   }
 
+  // 诊断：用最小回调运行，用于二分定位卡点
+  private runCurrentSceneSilent(): void {
+    let handle: number = this.lastRunHandle;
+    if (handle < 0) {
+      for (const n of this.nodes) {
+        if (n.className === 'SPH run' || n.className === 'N-body run') {
+          handle = n.handle;
+          break;
+        }
+      }
+    }
+    if (handle < 0) {
+      this.noticeService.warn('没有可运行的场景', '先建场景');
+      return;
+    }
+    try {
+      interface OpResult {
+        ok: boolean;
+        error?: string;
+      }
+      const res: OpResult = JSON.parse(String(ark.runSimulation(handle, 3600, true))) as OpResult;
+      if (!res.ok) {
+        this.noticeService.error('无法启动模拟', res.error ?? '');
+        return;
+      }
+      this.simRunning = true;
+      this.noticeService.info('已启动（静默回调）', `句柄 ${handle}`);
+      this.pollSim();
+    } catch (e) {
+      this.noticeService.error('无法启动模拟', String(e));
+    }
+  }
+
   // 直接运行当前场景：不依赖界面选中，优先用预设建图时记录的运行句柄
   private runCurrentScene(): void {
     let handle: number = this.lastRunHandle;
@@ -3526,8 +3559,10 @@ interface Probe {
         }
       } else if (index === 4) {
         this.selfTest();
-      } else {
+      } else if (index === 5) {
         this.runCurrentScene();
+      } else {
+        this.runCurrentSceneSilent();
       }
     } else if (name === '渲染') {
       if (index === 3) {
@@ -3570,7 +3605,7 @@ interface Probe {
     }
     if (name === '模拟') {
       return ['开始运行', this.simPaused ? '继续' : '暂停', '停止',
-        this.simRecording ? '停止录制' : '录制过程', '自检（IC+模拟）', '运行当前场景（自动定位运行节点）'];
+        this.simRecording ? '停止录制' : '录制过程', '自检（IC+模拟）', '运行当前场景（自动定位运行节点）', '诊断：静默运行（最小回调）'];
     }
     if (name === '渲染') {
       return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）'];

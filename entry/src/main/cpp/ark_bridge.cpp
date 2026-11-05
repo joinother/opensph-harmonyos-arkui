@@ -2519,6 +2519,32 @@ SimState& simState() {
     return state;
 }
 
+// 诊断用：最小回调，只记录 setUp/结束，不做任何快照或暂停等待
+class SilentCallbacks : public IJobCallbacks {
+private:
+    SimState& state;
+public:
+    explicit SilentCallbacks(SimState& state) : state(state) {}
+    virtual void onStart(const IJob&) override {}
+    virtual void onEnd(const Storage&, const Statistics&) override {}
+    virtual void onSetUp(const Storage& storage, Statistics&) override {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.setUpCount += 1;
+        state.particles = storage.getParticleCnt();
+        state.stage = "静默回调 setUp 完成";
+    }
+    virtual bool shouldAbortRun() const override { return false; }
+    virtual void onTimeStep(const Storage& storage, Statistics& stats) override {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.steps += 1;
+        state.timeStepCount += 1;
+        state.stage = "静默回调运行中";
+        if (stats.has(StatisticsId::RUN_TIME)) {
+            state.time = double(stats.get<Float>(StatisticsId::RUN_TIME));
+        }
+    }
+};
+
 class SimCallbacks : public IJobCallbacks {
 private:
     SimState& state;
@@ -2535,6 +2561,7 @@ public:
         std::lock_guard<std::mutex> lock(state.mutex);
         state.particles = storage.getParticleCnt();
         state.setUpCount += 1;
+        state.stage = "回调 setUp 完成";
         if (stats.has(StatisticsId::RUN_TIME)) {
             state.time = double(stats.get<Float>(StatisticsId::RUN_TIME));
         }
@@ -2576,16 +2603,25 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
+        {
+            std::lock_guard<std::mutex> lk(state.mutex);
+            state.stage = "回调：统计已更新，准备快照";
+        }
         // 实时预览快照：每 3 步刷新一次。
         // 注意：onTimeStep 也会被非粒子作业（IC、几何、材料）调用，那里没有 POSITION，
         // 直接取会抛 Invalid storage access 并中断整个运行，所以必须先判粒子数并吞掉异常。
         if (state.steps % 3 == 0 && storage.getParticleCnt() > 0) {
+            {
+                std::lock_guard<std::mutex> lk(state.mutex);
+                state.stage = "回调：正在生成预览快照";
+            }
             try {
                 std::vector<float> pts;
                 sampleStorage(storage, 4000, pts);
                 std::lock_guard<std::mutex> lock(state.mutex);
                 state.snapshot.swap(pts);
                 state.snapshotStep = state.steps;
+                state.stage = "回调：快照完成";
             } catch (const std::exception&) {
                 // 该作业没有粒子量，跳过这一帧
             }
@@ -3043,14 +3079,20 @@ napi_value simExportStatus(napi_env env, napi_callback_info info) {
 }
 
 napi_value runSimulation(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value argv[2];
+    size_t argc = 3;
+    napi_value argv[3];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     int32_t handle = -1;
     napi_get_value_int32(env, argv[0], &handle);
     double endTime = 0;
     if (argc > 1) {
         napi_get_value_double(env, argv[1], &endTime);
+    }
+    bool silent = false;
+    if (argc > 2) {
+        bool b = false;
+        napi_get_value_bool(env, argv[2], &b);
+        silent = b;
     }
     const auto it = nodeRegistry().find(handle);
     if (it == nodeRegistry().end()) {
@@ -3091,9 +3133,12 @@ napi_value runSimulation(napi_env env, napi_callback_info info) {
         st.particles = 0;
         st.error.clear();
     }
-    std::thread worker([node, endTime]() {
+    std::thread worker([node, endTime, silent]() {
         SimState& st = simState();
-        SimCallbacks callbacks(st);
+        SimCallbacks normal(st);
+        SilentCallbacks quiet(st);
+        IJobCallbacks& callbacks = silent ? static_cast<IJobCallbacks&>(quiet)
+                                          : static_cast<IJobCallbacks&>(normal);
         auto setStage = [&st](const char* s8) {
             std::lock_guard<std::mutex> lk(st.mutex);
             st.stage = s8;
