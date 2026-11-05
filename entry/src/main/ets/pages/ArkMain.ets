@@ -2009,6 +2009,42 @@ ${circles}
   }
 
   // 网格导出：先生成到沙箱（耗时操作不依赖前台），成功后再弹保存面板复制
+  // 诊断用：只生成到沙箱，不弹保存面板（用于验证网格生成能力本身）
+  private meshToSandbox(): void {
+    let handle: number = -1;
+    for (const n of this.nodes) {
+      if (n.handle >= 0 && n.className !== 'SPH run' && n.className !== 'N-body run'
+        && n.className !== 'Position based run') {
+        handle = n.handle;
+        break;
+      }
+    }
+    if (handle < 0) {
+      this.noticeService.warn('没有可导出的节点', '先建场景');
+      return;
+    }
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const path: string = `${ctx.filesDir}/mesh-demo.obj`;
+      interface MeshResult {
+        ok: boolean;
+        triangles?: number;
+        error?: string;
+        fallback?: boolean;
+      }
+      const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, path, 0))) as MeshResult;
+      if (!res.ok) {
+        this.noticeService.error('网格生成失败', res.error ?? '');
+        return;
+      }
+      const st: fs.Stat = fs.statSync(path);
+      this.noticeService.success('网格已生成到沙箱',
+        `${res.triangles ?? 0} 面 · ${(st.size / 1024).toFixed(1)} KB · ${res.fallback ? '包围体' : '等值面'}`);
+    } catch (e) {
+      this.noticeService.error('网格生成异常', String(e));
+    }
+  }
+
   private async exportMeshFile(ext: string): Promise<void> {
     const handle: number = this.selectedNode >= 0 ? (this.nodeById(this.selectedNode)?.handle ?? -1) : -1;
     if (handle < 0) {
@@ -3960,6 +3996,10 @@ ${circles}
         this.runCurrentSceneSilent();
       }
     } else if (name === '渲染') {
+      if (index === 6) {
+        this.meshToSandbox();
+        return;
+      }
       if (index === 4) {
         this.exportMeshFile('obj');
         return;
@@ -4011,7 +4051,7 @@ ${circles}
         this.simRecording ? '停止录制' : '录制过程', '自检（IC+模拟）', '运行当前场景（自动定位运行节点）', '诊断：静默运行（最小回调）'];
     }
     if (name === '渲染') {
-      return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）', '导出网格 OBJ', '导出网格 PLY'];
+      return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）', '导出网格 OBJ', '导出网格 PLY', '生成网格到沙箱（诊断）'];
     }
     return ['自检', '关于'];
   }

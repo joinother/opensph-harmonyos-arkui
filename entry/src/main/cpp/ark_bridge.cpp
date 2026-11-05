@@ -823,6 +823,12 @@ public:
 }  // namespace
 
 napi_value exportMesh(napi_env env, napi_callback_info info) {
+    // 安全开关：网格写出路径在设备上会触发崩溃（疑内核 FileSystem 与 OHOS 的绑定问题），
+    // 先返回明确错误，避免整机应用被拖崩；待原生写文件方案确定后恢复。
+    if (getenv("OPENSPH_MESH_EXPORT") == nullptr) {
+        return makeString(env,
+            "{\"ok\":false,\"error\":\"网格导出暂时停用（内核写盘路径在设备上崩溃），待修复\"}");
+    }
     size_t argc = 3;
     napi_value argv[3];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
