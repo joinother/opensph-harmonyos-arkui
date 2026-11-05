@@ -2029,12 +2029,22 @@ ${circles}
         triangles?: number;
         error?: string;
       }
-      const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, uris[0], 0.6))) as MeshResult;
+      // 先写应用沙箱：内核写 URI 可能失败，沙箱路径可校验大小后再复制
+      const sandbox: string = `${this.getUIContext().getHostContext()!.filesDir}/export.${ext}`;
+      const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, sandbox, 0))) as MeshResult;
       if (!res.ok) {
         this.noticeService.error('导出网格失败', res.error ?? '');
         return;
       }
-      this.noticeService.success('网格已导出', `${res.triangles ?? 0} 个三角面（.${ext}）`);
+      const st: fs.Stat = fs.statSync(sandbox);
+      if (st.size <= 0) {
+        this.noticeService.error('网格文件为空', `三角面 ${res.triangles ?? 0} 个，文件 0 字节`);
+        return;
+      }
+      fs.copyFileSync(sandbox, uris[0]);
+      const st2: fs.Stat = fs.statSync(uris[0]);
+      this.noticeService.success('网格已导出',
+        `${res.triangles ?? 0} 个三角面 · ${(st2.size / 1024).toFixed(1)} KB（.${ext}）`);
     } catch (e) {
       this.noticeService.error('导出网格失败', String(e));
     }

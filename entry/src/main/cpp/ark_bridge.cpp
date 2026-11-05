@@ -861,7 +861,8 @@ napi_value exportMesh(napi_env env, napi_callback_info info) {
     }
     const double sizeX = mx[0] - mn[0], sizeY = mx[1] - mn[1], sizeZ = mx[2] - mn[2];
     const double ext = std::max(std::max(sizeX, sizeY), sizeZ);
-    const double radius = std::max(ext * 0.06, 1e-6);
+    const double cellGuess = ext / 64.0;
+    const double radius = std::max(std::max(ext * 0.06, cellGuess * 1.5), 1e-6);
     const Vector center(0.5 * (mn[0] + mx[0]), 0.5 * (mn[1] + mx[1]), 0.5 * (mn[2] + mx[2]));
     const double half = 0.5 * ext + radius;
 
@@ -903,7 +904,8 @@ napi_value exportMesh(napi_env env, napi_callback_info info) {
     if (!res) {
         return makeString(env, "{\"ok\":false,\"error\":\"写入网格失败\"}");
     }
-    return makeString(env, "{\"ok\":true,\"triangles\":" + std::to_string(triRef.size()) + "}");
+    return makeString(env, "{\"ok\":true,\"triangles\":" + std::to_string(triRef.size())
+        + ",\"iso\":" + std::to_string(iso) + ",\"peak\":" + std::to_string(peak) + "}");
 }
 
 napi_value setFilmic(napi_env env, napi_callback_info info) {
