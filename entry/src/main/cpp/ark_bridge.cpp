@@ -742,6 +742,26 @@ napi_value setSession(napi_env env, napi_callback_info info) {
         + ",\"nodes\":" + std::to_string(nodeRegistry().size()) + "}");
 }
 
+
+napi_value paletteSample(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t kind = 0;
+    double t = 0.5;
+    if (argc >= 1) { napi_get_value_int32(env, argv[0], &kind); }
+    if (argc >= 2) { napi_get_value_double(env, argv[1], &t); }
+    const int saved = g_paletteKind;
+    g_paletteKind = kind;
+    double r = 0, g = 0, b = 0;
+    paletteColor(t, r, g, b);
+    g_paletteKind = saved;
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "{\"r\":%d,\"g\":%d,\"b\":%d}",
+        int(std::lround(r)), int(std::lround(g)), int(std::lround(b)));
+    return makeString(env, buf);
+}
+
 napi_value setPalette(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value argv[4];
@@ -3435,6 +3455,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"buildRochePreset", nullptr, buildRochePreset, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSession", nullptr, setSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setPalette", nullptr, setPalette, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"paletteSample", nullptr, paletteSample, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dumpSettingCatalog", nullptr, dumpSettingCatalog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"nodeSettings", nullptr, nodeSettings, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setNodeSetting", nullptr, setNodeSetting, nullptr, nullptr, nullptr, napi_default, nullptr},

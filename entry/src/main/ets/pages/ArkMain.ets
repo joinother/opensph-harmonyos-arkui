@@ -487,6 +487,27 @@ struct ArkMain {
   }
 
   private loadPreview(): void {
+    // 未选中时自动选运行节点：否则预览只会提示「请选择一个节点」并显示黑屏
+    if (this.selectedNode < 0) {
+      let pick: GraphNode | undefined = undefined;
+      for (const n of this.nodes) {
+        if (n.handle === this.lastRunHandle) {
+          pick = n;
+          break;
+        }
+      }
+      if (pick === undefined) {
+        for (const n of this.nodes) {
+          if (n.className === 'SPH run' || n.className === 'N-body run') {
+            pick = n;
+            break;
+          }
+        }
+      }
+      if (pick !== undefined) {
+        this.selectedNode = pick.id;
+      }
+    }
     const node: GraphNode | undefined = this.nodeById(this.selectedNode);
     if (!node || node.handle < 0) {
       this.previewError = '请选择一个节点';
@@ -2317,6 +2338,26 @@ interface Probe {
     }
   }
 
+  // 取 20 段色带：直接调用内核的色标函数，保证与渲染器一致
+  private paletteSwatches(): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      const t: number = i / 19;
+      try {
+        interface Rgb {
+          r: number;
+          g: number;
+          b: number;
+        }
+        const c: Rgb = JSON.parse(String(ark.paletteSample(this.palKind, t))) as Rgb;
+        out.push(`rgb(${c.r},${c.g},${c.b})`);
+      } catch (e) {
+        out.push('#cccccc');
+      }
+    }
+    return out;
+  }
+
   private applyPalette(): void {
     try {
       ark.setPalette(this.palKind, this.palMin, this.palMax, this.palOn);
@@ -2359,6 +2400,13 @@ interface Probe {
       }
       .width('100%');
 
+      Text('色带预览（内核同一色标函数）').fontSize(10).fontColor('#8b929b').width('100%');
+      Row({ space: 0 }) {
+        ForEach(this.paletteSwatches(), (c: string, i: number) => {
+          Row().width(12).height(18).backgroundColor(c);
+        }, (c: string, i: number) => `${i}_${c}`)
+      }
+      .width('100%');
       Text(`取值范围：${this.palMin.toFixed(2)} — ${this.palMax.toFixed(2)}`)
         .fontSize(11).fontColor('#5f6670').width('100%');
       Slider({ value: this.palMin, min: 0, max: 1, step: 0.05 })
