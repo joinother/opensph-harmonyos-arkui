@@ -1394,7 +1394,6 @@ interface Probe {
   }
 
   private startSimExportVideo(): void {
-    try { ark.setSession(this.sid); } catch (e) { }
     // 优先走 C++ 原生预设（绕开「按字符串键写设置」不可靠的问题）
     if (this.nodes.length === 0) {
       let runHandle: number = -1;
@@ -2615,7 +2614,6 @@ interface Probe {
   }
 
   private addNode(item: JobEntry): void {
-    try { ark.setSession(this.sid); } catch (e) { }
     const offset: number = (this.nodes.length % 6) * 28;
     let handle: number = -1;
     try {
@@ -3348,16 +3346,18 @@ interface Probe {
     this.openMenu = '';
     if (name === '文件') {
       if (index === 0) {
-        // 新建窗口：启动一个新的 Ability 实例（multiton），各自独立窗口
-        this.startNewWindow();
+        // 新建会话：只清空当前窗口（内核也随之换新会话）
         this.clearAll();
-        this.noticeService.info('新建会话', '已清空画布');
+        this.noticeService.info('新建会话', '已清空画布（内核状态已隔离）');
       } else if (index === 1) {
         this.openSessionFrom();
       } else if (index === 2) {
         this.saveSession();
       } else if (index === 3) {
         this.saveSessionAs();
+      } else if (index === 4) {
+        // 新建窗口：multiton 下每次启动都是独立实例与窗口
+        this.startNewWindow();
       } else {
         const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
         ctx.terminateSelf();
@@ -3500,7 +3500,7 @@ interface Probe {
 
   private menuLabels(name: string): string[] {
     if (name === '文件') {
-      return ['新建窗口', '打开工程…', '保存工程', '另存为…', '退出'];
+      return ['新建会话', '打开工程…', '保存工程', '另存为…', '新建窗口', '退出'];
     }
     if (name === '编辑') {
       return ['删除选中节点', '克隆选中节点', '删除选中节点及其下游', '清空画布'];
