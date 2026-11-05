@@ -551,3 +551,27 @@ export const ENUM_LABELS_EXTRA: Map<string, string> = new Map<string, string>([
   ['velocity', '速度'],
   ['velocity divergence', '速度散度'],
 ]);
+
+// 作业自身分类的补充翻译（卡片副标题用；与作业库分组分类不同）
+export const CATEGORY_LABELS_EXTRA: Map<string, string> = new Map<string, string>([
+  ['transform', '坐标变换'],
+  ['join', '合并'],
+  ['set Keplerian velocity', '设置开普勒速度'],
+  ['extract particles in domain', '提取域内粒子'],
+  ['emplaced components', '组合分量'],
+  ['subsampler', '重采样'],
+  ['create monolithic body', '生成整体天体'],
+  ['geometry', '几何'],
+  ['initial conditions', '初始条件'],
+  ['material', '材质'],
+  ['boundary conditions', '边界条件'],
+  ['SPH stabilization', 'SPH 稳定化'],
+  ['N-body run', 'N 体模拟'],
+  ['Position based run', '位置约束模拟'],
+  ['gravity', '引力'],
+  ['integrator', '积分器'],
+  ['output', '输出'],
+  ['analysis', '分析'],
+  ['collision', '碰撞'],
+  ['fragmentation', '碎裂'],
+]);

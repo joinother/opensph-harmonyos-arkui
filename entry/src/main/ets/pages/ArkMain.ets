@@ -2,7 +2,7 @@
 // 动效：入场淡入上移、左栏折叠、选中过渡、节点淡入、拖拽跟手、连线实时跟随。
 import ark from 'libopensph_ark.so';
 import { AppNotice, NoticeLevel, NoticeService } from '../common/NotificationCenter';
-import { CATEGORY_LABELS, ENUM_LABELS, ENUM_LABELS_EXTRA, SETTING_LABELS, SETTING_LABELS_EXTRA } from '../common/I18nZh';
+import { CATEGORY_LABELS, CATEGORY_LABELS_EXTRA, ENUM_LABELS, ENUM_LABELS_EXTRA, SETTING_LABELS, SETTING_LABELS_EXTRA } from '../common/I18nZh';
 import hilog from '@ohos.hilog';
 import window from '@ohos.window';
 import display from '@ohos.display';
@@ -393,6 +393,13 @@ struct ArkMain {
   @State private stRaw: string = '';
   @State private stTimeSteps: number = 0;
   private lastRunHandle: number = -1;
+  // 调色板（第 4 项）
+  @State private palOpen: boolean = false;
+  @State private palOn: boolean = false;
+  @State private palKind: number = 0;
+  @State private palMin: number = 0;
+  @State private palMax: number = 1;
+  private palNames: string[] = ['灰阶', '蓝→红', '维里迪斯', '等离子'];
   private statSeries: number[] = [];
   private statCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private pinchStartZoom: number = 1;
@@ -987,7 +994,8 @@ struct ArkMain {
 
   private label(category: string): string {
     // 先用画布精简表，再回落到完整分类表（71 条），避免露出英文类名
-    const zh: string | undefined = CATEGORY_LABEL.get(category) ?? CATEGORY_LABELS.get(category);
+    const zh: string | undefined = CATEGORY_LABEL.get(category)
+      ?? CATEGORY_LABELS.get(category) ?? CATEGORY_LABELS_EXTRA.get(category);
     return annotate(zh !== undefined ? zh : category);
   }
 
@@ -2309,6 +2317,63 @@ interface Probe {
     }
   }
 
+  private applyPalette(): void {
+    try {
+      ark.setPalette(this.palKind, this.palMin, this.palMax, this.palOn);
+      this.loadPreview();
+      hilog.info(0x0000, 'OpenSPHPaletteUi',
+        `kind=${this.palKind} on=${this.palOn} range=[${this.palMin},${this.palMax}]`);
+    } catch (e) {
+      this.noticeService.error('调色板设置失败', String(e));
+    }
+  }
+
+  // 调色板面板
+  @Builder
+  palettePanel() {
+    Column({ space: 8 }) {
+      Row() {
+        Text('调色板').fontSize(13).fontWeight(FontWeight.Medium);
+        Blank();
+        Text('×').fontSize(14).fontColor('#5f6670')
+          .onClick(() => { this.palOpen = false; });
+      }
+      .width('100%');
+
+      Row() {
+        Text('启用按物理量着色').fontSize(11).fontColor('#5f6670');
+        Blank();
+        Toggle({ type: ToggleType.Switch, isOn: this.palOn })
+          .onChange((v: boolean) => { this.palOn = v; this.applyPalette(); });
+      }
+      .width('100%');
+
+      Row() {
+        Text('色标').fontSize(11).fontColor('#5f6670');
+        Blank();
+        Select([{ value: this.palNames[0] }, { value: this.palNames[1] },
+          { value: this.palNames[2] }, { value: this.palNames[3] }])
+          .selected(this.palKind)
+          .value(this.palNames[this.palKind])
+          .onSelect((index: number) => { this.palKind = index; this.applyPalette(); });
+      }
+      .width('100%');
+
+      Text(`取值范围：${this.palMin.toFixed(2)} — ${this.palMax.toFixed(2)}`)
+        .fontSize(11).fontColor('#5f6670').width('100%');
+      Slider({ value: this.palMin, min: 0, max: 1, step: 0.05 })
+        .onChange((v: number) => { this.palMin = v; this.applyPalette(); });
+      Slider({ value: this.palMax, min: 0, max: 1, step: 0.05 })
+        .onChange((v: number) => { this.palMax = v; this.applyPalette(); });
+    }
+    .width(280)
+    .padding(14)
+    .backgroundColor('#ffffff')
+    .borderRadius(12)
+    .border({ width: 1, color: '#dfe3e8' })
+    .shadow({ radius: 18, color: '#22000000', offsetY: 6 });
+  }
+
   private startSim(): void {
     const node: GraphNode | undefined = this.nodeById(this.selectedNode);
     if (!node || node.handle < 0) {
@@ -3503,6 +3568,8 @@ interface Probe {
         hilog.info(0x0000, 'OpenSPHMotion',
           `reduceMotion=${this.reduceMotion} MOTION_SCALE=${MOTION_SCALE} durBase=${durMs(DUR_BASE)}ms durFast=${durMs(DUR_FAST)}ms`);
         this.saveMotionPref();
+      } else if (index === 10) {
+        this.palOpen = !this.palOpen;
       } else if (index === 5) {
         this.getUIContext().animateTo({ duration: durMs(DUR_BASE), curve: Curve.EaseOut }, () => {
           this.collapsed = false;
@@ -3604,7 +3671,7 @@ interface Probe {
         '复位画布', this.reduceMotion ? '恢复动效' : '减少动效',
         '加宽左栏', '加宽右栏', '复位面板宽度',
         `纹理：${this.textureKind === 0 ? '无' : (this.textureKind === 1 ? '类地球' : '类月球')}`,
-        this.remoteEnabled ? '关闭远程接口' : '开启远程接口'];
+        this.remoteEnabled ? '关闭远程接口' : '开启远程接口', '调色板…'];
     }
     if (name === '模拟') {
       return ['开始运行', this.simPaused ? '继续' : '暂停', '停止',
@@ -5584,7 +5651,17 @@ interface Probe {
         }
         Column() {
           this.canvasTabs()
-          this.canvasPane()
+          Stack() {
+            this.canvasPane()
+            if (this.palOpen) {
+              Column() {
+                this.palettePanel()
+              }
+              .position({ x: 24, y: 24 })
+            }
+          }
+          .layoutWeight(1)
+          .width('100%')
           this.statPanel()
         }
         .layoutWeight(1)

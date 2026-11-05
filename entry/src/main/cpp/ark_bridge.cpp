@@ -93,6 +93,39 @@ static thread_local const std::vector<uint8_t>* tlsTexSnap[kMaxTex] = { nullptr 
 static thread_local int tlsTexW[kMaxTex] = { 0 };
 static thread_local int tlsTexH[kMaxTex] = { 0 };
 
+
+// ---- 可配置调色板 ----
+static int g_paletteKind = 0;      // 0 灰阶 1 蓝红 2 维里迪斯近似 3 等离子近似
+static bool g_paletteOn = false;   // 关闭时沿用原回退色
+static double g_paletteMin = 0.0;
+static double g_paletteMax = 1.0;
+
+static void paletteColor(const double tIn, double& r, double& g, double& b) {
+    const double t = std::min(1.0, std::max(0.0, tIn));
+    switch (g_paletteKind) {
+    case 1:  // 蓝 → 红
+        r = 255.0 * t;
+        g = 255.0 * (1.0 - std::fabs(t - 0.5) * 2.0) * 0.35;
+        b = 255.0 * (1.0 - t);
+        break;
+    case 2:  // 维里迪斯近似
+        r = 255.0 * (0.267 + t * (0.62 - 0.55 * t));
+        g = 255.0 * (0.004 + t * (1.05 - 0.42 * t));
+        b = 255.0 * (0.329 + t * (0.18 + 0.42 * t));
+        break;
+    case 3:  // 等离子近似
+        r = 255.0 * (0.05 + t * (1.9 - 0.9 * t));
+        g = 255.0 * (0.03 + t * (0.35 + 0.4 * t));
+        b = 255.0 * (0.53 + t * (1.1 - 0.75 * t));
+        break;
+    default: // 灰阶
+        r = 255.0 * (0.35 + 0.6 * t);
+        g = r;
+        b = r;
+        break;
+    }
+}
+
 /// 双线性采样；返回 false 表示没有纹理
 static bool sampleTexture(const int slot, const double u, const double v,
     double& outR, double& outG, double& outB) {
@@ -411,11 +444,18 @@ static void splatPoints(const std::vector<float>& pts,
         } else {
         // 统一回退色：没有贴图时用中性灰白（按半径做很轻微的内深外浅），
         // 不再使用橙/品红色标，避免被误认为贴图颜色出错。
-        const double t = std::min(1.0, std::max(0.0, double(sm.rr)));
-        const double g = 150.0 + 55.0 * t;   // 150 → 205 的中性灰
-        mr = g;
-        mg = g;
-        mb = g * 1.01;                        // 极轻微偏冷，避免纯灰发闷
+        if (g_paletteOn) {
+            const double span = (g_paletteMax - g_paletteMin) > 1e-9
+                ? (g_paletteMax - g_paletteMin) : 1.0;
+            const double tv = (double(sm.rr) - g_paletteMin) / span;
+            paletteColor(tv, mr, mg, mb);
+        } else {
+            const double t = std::min(1.0, std::max(0.0, double(sm.rr)));
+            const double g = 150.0 + 55.0 * t;   // 150 → 205 的中性灰
+            mr = g;
+            mg = g;
+            mb = g * 1.01;                        // 极轻微偏冷，避免纯灰发闷
+        }
         }
         const double texGain = hasTex ? 1.55 : 1.0;
         const double cr = std::min(255.0, mr * lum * texGain + 240 * spec);
@@ -701,6 +741,28 @@ napi_value setSession(napi_env env, napi_callback_info info) {
     return makeString(env, "{\"ok\":true,\"sid\":" + std::to_string(want)
         + ",\"nodes\":" + std::to_string(nodeRegistry().size()) + "}");
 }
+
+napi_value setPalette(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t kind = 0;
+    bool on = false;
+    double mn = 0.0, mx = 1.0;
+    if (argc >= 1) { napi_get_value_int32(env, argv[0], &kind); }
+    if (argc >= 2) { napi_get_value_double(env, argv[1], &mn); }
+    if (argc >= 3) { napi_get_value_double(env, argv[2], &mx); }
+    if (argc >= 4) { napi_get_value_bool(env, argv[3], &on); }
+    g_paletteKind = kind;
+    g_paletteMin = mn;
+    g_paletteMax = mx;
+    g_paletteOn = on;
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHPalette",
+        "kind=%{public}d on=%{public}d range=[%{public}.3f,%{public}.3f]",
+        kind, on ? 1 : 0, mn, mx);
+    return makeString(env, "{\"ok\":true}");
+}
+
 
 int nextNodeHandle = 1;
 
@@ -3372,6 +3434,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"createNode", nullptr, createNode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"buildRochePreset", nullptr, buildRochePreset, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSession", nullptr, setSession, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setPalette", nullptr, setPalette, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dumpSettingCatalog", nullptr, dumpSettingCatalog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"nodeSettings", nullptr, nodeSettings, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setNodeSetting", nullptr, setNodeSetting, nullptr, nullptr, nullptr, napi_default, nullptr},
