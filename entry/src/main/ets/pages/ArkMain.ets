@@ -390,6 +390,7 @@ struct ArkMain {
   @State private stError: string = '';
   @State private stSetUp: number = 0;
   @State private stStage: string = '';
+  @State private stRaw: string = '';
   @State private stTimeSteps: number = 0;
   private lastRunHandle: number = -1;
   private statSeries: number[] = [];
@@ -2368,7 +2369,9 @@ interface Probe {
       }
       let st: SimStatus | null = null;
       try {
-        st = JSON.parse(String(ark.simulationStatus())) as SimStatus;
+        const rawJson: string = String(ark.simulationStatus());
+        this.stRaw = rawJson;
+        st = JSON.parse(rawJson) as SimStatus;
       } catch (e) {
         st = null;
       }
@@ -2394,8 +2397,8 @@ interface Probe {
       this.stProgress = st.progress !== undefined ? st.progress : 0;
       this.stEta = st.eta !== undefined ? st.eta : 0;
       this.stDt = st.dt !== undefined ? st.dt : 0;
-      if (st.particles > 0) {
-        this.statSeries = this.statSeries.concat([st.particles]);
+      if (st.running) {
+        this.statSeries = this.statSeries.concat([st.progress !== undefined ? st.progress : 0]);
         if (this.statSeries.length > 120) {
           this.statSeries = this.statSeries.slice(this.statSeries.length - 120);
         }
@@ -4123,14 +4126,38 @@ interface Probe {
             .padding({ left: 10, bottom: 2 });
         }
         Row({ space: 14 }) {
-          this.statChip('时间 [s]', this.stTime.toFixed(3));
-          this.statChip('进度', `${(this.stProgress * 100).toFixed(1)}%`);
-          this.statChip('墙钟 [s]', this.stWall.toFixed(1));
-          this.statChip('剩余 [s]', this.stEta > 0 ? this.stEta.toFixed(0) : '—');
-          this.statChip('时间步', this.stDt.toExponential(2));
-          this.statChip('粒子', String(this.stParticles));
-          this.statChip('步数', String(this.stSteps));
-          this.statChip('初始化', `${this.stSetUp}/${this.stTimeSteps}`);
+          Column() {
+            Text('时间 [s]').fontSize(9).fontColor('#8b929b');
+            Text(this.stTime.toFixed(3)).fontSize(11).fontColor('#1f2328');
+          }.alignItems(HorizontalAlign.Start);
+          Column() {
+            Text('进度').fontSize(9).fontColor('#8b929b');
+            Text(`${(this.stProgress * 100).toFixed(1)}%`).fontSize(11).fontColor('#1f2328');
+          }.alignItems(HorizontalAlign.Start);
+          Column() {
+            Text('墙钟 [s]').fontSize(9).fontColor('#8b929b');
+            Text(this.stWall.toFixed(1)).fontSize(11).fontColor('#1f2328');
+          }.alignItems(HorizontalAlign.Start);
+          Column() {
+            Text('剩余 [s]').fontSize(9).fontColor('#8b929b');
+            Text(this.stEta > 0 ? this.stEta.toFixed(0) : '—').fontSize(11).fontColor('#1f2328');
+          }.alignItems(HorizontalAlign.Start);
+          Column() {
+            Text('时间步').fontSize(9).fontColor('#8b929b');
+            Text(this.stDt > 0 ? this.stDt.toExponential(2) : '—').fontSize(11).fontColor('#1f2328');
+          }.alignItems(HorizontalAlign.Start);
+          Column() {
+            Text('粒子').fontSize(9).fontColor('#8b929b');
+            Text(String(this.stParticles)).fontSize(11).fontColor('#1f2328');
+          }.alignItems(HorizontalAlign.Start);
+          Column() {
+            Text('步数').fontSize(9).fontColor('#8b929b');
+            Text(String(this.stSteps)).fontSize(11).fontColor('#1f2328');
+          }.alignItems(HorizontalAlign.Start);
+          Column() {
+            Text('初始化').fontSize(9).fontColor('#8b929b');
+            Text(`${this.stSetUp}/${this.stTimeSteps}`).fontSize(11).fontColor('#1f2328');
+          }.alignItems(HorizontalAlign.Start);
         }
         .width('100%')
         .padding({ left: 10, right: 10, bottom: 4 });
@@ -4188,15 +4215,10 @@ interface Probe {
     if (n < 2) {
       this.statCtx.fillStyle = '#b0b6be';
       this.statCtx.font = '10px sans-serif';
-      this.statCtx.fillText('运行后显示粒子数曲线', 8, h / 2 + 3);
+      this.statCtx.fillText('运行后显示进度曲线', 8, h / 2 + 3);
       return;
     }
-    let mx: number = 1;
-    for (const v of this.statSeries) {
-      if (v > mx) {
-        mx = v;
-      }
-    }
+    const mx: number = 1;   // 进度固定 0..1
     this.statCtx.strokeStyle = '#0b57d0';
     this.statCtx.lineWidth = 1.5;
     this.statCtx.beginPath();

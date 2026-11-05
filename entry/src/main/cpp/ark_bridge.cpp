@@ -3307,12 +3307,14 @@ napi_value simulationStatus(napi_env env, napi_callback_info) {
         st.particles);
     std::string json(buf);
     // 内核统计量：一次性暴露给界面（运行状态面板与曲线图用）
-    char sbuf[512];
-    std::snprintf(sbuf, sizeof(sbuf),
-        ",\"wallclock\":%.6g,\"progress\":%.6g,\"eta\":%.6g,\"dt\":%.6g,\"dtElapsed\":%.6g"
-        ",\"sphEval\":%.6g,\"gravBuild\":%.6g",
-        st.wallclock, st.progress, st.eta, st.dt, st.dtElapsed, st.sphEval, st.gravBuild);
-    json += sbuf;
+    // 用 jsonFloat 逐项拼接，避免 snprintf 参数错位（此前 wallclock 显示成 1e+209）
+    json += ",\"wallclock\":" + jsonFloat(st.wallclock);
+    json += ",\"progress\":" + jsonFloat(st.progress);
+    json += ",\"eta\":" + jsonFloat(st.eta);
+    json += ",\"dt\":" + jsonFloat(st.dt);
+    json += ",\"dtElapsed\":" + jsonFloat(st.dtElapsed);
+    json += ",\"sphEval\":" + jsonFloat(st.sphEval);
+    json += ",\"gravBuild\":" + jsonFloat(st.gravBuild);
     char dbuf[128];
     std::snprintf(dbuf, sizeof(dbuf), ",\"setUpCount\":%d,\"timeStepCount\":%d",
         st.setUpCount, st.timeStepCount);
