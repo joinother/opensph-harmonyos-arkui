@@ -400,11 +400,15 @@ struct ArkMain {
   @State private stSetUp: number = 0;
   @State private stStage: string = '';
   @State private meshInfo: string = '网格：未生成';
+  @State private progInfo: string = '进度：无';
   @State private stRaw: string = '';
   @State private stTimeSteps: number = 0;
   private lastRunHandle: number = -1;
   private expFrames: number = 0;
   private expDuration: number = 0;
+  private expW: number = 1920;
+  private expH: number = 1080;
+  private expFps: number = 60;
   // 调色板（第 4 项）
   @State private palOpen: boolean = false;
   @State private palOn: boolean = false;
@@ -2021,6 +2025,42 @@ ${circles}
   }
 
   // 网格导出：先生成到沙箱（耗时操作不依赖前台），成功后再弹保存面板复制
+  // 诊断：导出到沙箱固定路径，不弹任何面板（用于验证进度持久化与续渲）
+  private diagExportToSandbox(): void {
+    if (this.lastRunHandle < 0) {
+      this.noticeService.warn('没有可渲染的场景', '先建场景');
+      return;
+    }
+    try {
+      ark.setSession(this.sid);
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const outPath: string = `${ctx.filesDir}/videos/diag.mp4`;
+      const opts: string = `{"width":640,"height":360,"fps":10,"frames":30,"duration":3,`
+        + `"path":"${outPath}"}`;
+      interface StartRes {
+        ok: boolean;
+        taskId?: number;
+        frames?: number;
+        error?: string;
+      }
+      const res: StartRes = JSON.parse(String(ark.startSimExport(this.lastRunHandle, opts))) as StartRes;
+      if (!res.ok) {
+        this.noticeService.error('诊断导出失败', res.error ?? '');
+        return;
+      }
+      this.simTaskId = res.taskId ?? -1;
+      this.expFrames = res.frames ?? 0;
+      this.expDuration = 3;
+      this.expW = 640;
+      this.expH = 360;
+      this.expFps = 10;
+      this.noticeService.success('诊断导出已启动', `30 帧 → 沙箱 diag.mp4`);
+      this.pollSim();
+    } catch (e) {
+      this.noticeService.error('诊断导出异常', String(e));
+    }
+  }
+
   // ---- 分段续渲（第 9 项）----
   private progressPath(): string {
     const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -2054,6 +2094,9 @@ ${circles}
   // 续渲：读进度文件，从已完成帧继续，输出到新分段
   private resumeExport(): void {
     const prog: ExportProgress | null = this.readProgress();
+    this.progInfo = prog === null
+      ? '进度：读取失败或无进度文件'
+      : `进度：文件 ${prog.done}/${prog.frames} 帧 (${prog.width}×${prog.height})`;
     if (prog === null) {
       this.noticeService.warn('没有可续渲的进度', '先正常导出一段（中途停止也可）');
       return;
@@ -2918,9 +2961,10 @@ ${circles}
           const es: ExpStat = JSON.parse(String(ark.simExportStatus(this.simTaskId))) as ExpStat;
           const done: number = es.rendered ?? 0;
           if (done > 0) {
+            this.progInfo = `进度：已渲染 ${done}/${this.expFrames} 帧`;
             this.writeProgress({
-              width: 1920, height: 1080, fps: 60, frames: this.expFrames,
-              done: done, duration: this.expDuration
+              width: this.expW, height: this.expH, fps: this.expFps,
+              frames: this.expFrames, done: done, duration: this.expDuration
             });
           }
         } catch (e) {
@@ -4084,6 +4128,10 @@ ${circles}
         this.runCurrentSceneSilent();
       }
     } else if (name === '渲染') {
+      if (index === 7) {
+        this.diagExportToSandbox();
+        return;
+      }
       if (index === 6) {
         this.resumeExport();
         return;
@@ -4139,7 +4187,7 @@ ${circles}
         this.simRecording ? '停止录制' : '录制过程', '自检（IC+模拟）', '运行当前场景（自动定位运行节点）', '诊断：静默运行（最小回调）'];
     }
     if (name === '渲染') {
-      return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）', '导出网格 OBJ', '导出网格 PLY', '继续上次渲染（续渲）'];
+      return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）', '导出网格 OBJ', '导出网格 PLY', '继续上次渲染（续渲）', '沙箱导出（诊断）'];
     }
     return ['自检', '关于'];
   }
@@ -4923,7 +4971,8 @@ ${circles}
         })
         .margin({ right: 10 });
       if (this.canvasTab === 1) {
-        Text(this.meshInfo)
+        Text(this.progInfo).fontSize(9).fontColor('#0b7a33').margin({ left: 8 });
+      Text(this.meshInfo)
         .fontSize(9).fontColor('#b06000').margin({ left: 8 });
       Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 20) : '无'} pal=${this.palOn ? 1 : 0}/${this.palKind} film=${this.filmOn ? 1 : 0} cam=${this.yaw.toFixed(2)}/${this.pitch.toFixed(2)}`)
           .fontSize(9)
