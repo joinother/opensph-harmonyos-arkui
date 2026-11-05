@@ -97,6 +97,30 @@ static thread_local int tlsTexH[kMaxTex] = { 0 };
 // ---- 可配置调色板 ----
 static int g_paletteKind = 0;      // 0 灰阶 1 蓝红 2 维里迪斯近似 3 等离子近似
 static bool g_paletteOn = false;   // 关闭时沿用原回退色
+static bool g_filmicOn = false;      // Filmic 色调映射开关
+static double g_filmicExposure = 1.0;
+static double g_filmicContrast = 1.0;
+
+// ACES 近似曲线 + 曝光/对比度；输入输出均为 0..1
+static void filmicApply(double& r, double& g, double& b) {
+    if (!g_filmicOn) {
+        return;
+    }
+    double v[3] = { r, g, b };
+    for (int i = 0; i < 3; ++i) {
+        double x = std::max(0.0, v[i]) * g_filmicExposure;
+        // ACES 近似
+        const double a = 2.51, bb = 0.03, c = 2.43, d = 0.59, e = 0.14;
+        x = (x * (a * x + bb)) / (x * (c * x + d) + e);
+        // 对比度：以 0.5 为轴
+        x = 0.5 + (x - 0.5) * g_filmicContrast;
+        v[i] = std::min(1.0, std::max(0.0, x));
+    }
+    r = v[0];
+    g = v[1];
+    b = v[2];
+}
+
 static double g_paletteMin = 0.0;
 static double g_paletteMax = 1.0;
 
@@ -458,9 +482,11 @@ static void splatPoints(const std::vector<float>& pts,
         }
         }
         const double texGain = hasTex ? 1.55 : 1.0;
-        const double cr = std::min(255.0, mr * lum * texGain + 240 * spec);
-        const double cg = std::min(255.0, mg * lum * texGain + 240 * spec);
-        const double cb = std::min(255.0, mb * lum * texGain + 230 * spec);
+        double cr = std::min(255.0, mr * lum * texGain + 240 * spec) / 255.0;
+        double cg = std::min(255.0, mg * lum * texGain + 240 * spec) / 255.0;
+        double cb = std::min(255.0, mb * lum * texGain + 230 * spec) / 255.0;
+        filmicApply(cr, cg, cb);
+        cr *= 255.0; cg *= 255.0; cb *= 255.0;
         const double alpha = 0.07 + 0.20 * dn + 0.22 * spec;
         const int ir = std::max(1, int(std::lround(baseR * (0.6f + 0.8f * dn))));
         const int px0 = int(std::lround(sm.sx));
@@ -760,6 +786,25 @@ napi_value paletteSample(napi_env env, napi_callback_info info) {
     std::snprintf(buf, sizeof(buf), "{\"r\":%d,\"g\":%d,\"b\":%d}",
         int(std::lround(r)), int(std::lround(g)), int(std::lround(b)));
     return makeString(env, buf);
+}
+
+
+napi_value setFilmic(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    bool on = false;
+    double expo = 1.0, cont = 1.0;
+    if (argc >= 1) { napi_get_value_bool(env, argv[0], &on); }
+    if (argc >= 2) { napi_get_value_double(env, argv[1], &expo); }
+    if (argc >= 3) { napi_get_value_double(env, argv[2], &cont); }
+    g_filmicOn = on;
+    g_filmicExposure = expo;
+    g_filmicContrast = cont;
+    g_splatCache.clear();
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHFilmic",
+        "on=%{public}d expo=%{public}.2f contrast=%{public}.2f", on ? 1 : 0, expo, cont);
+    return makeString(env, "{\"ok\":true}");
 }
 
 napi_value setPalette(napi_env env, napi_callback_info info) {
@@ -2536,7 +2581,11 @@ void rasterizeCloud(const std::vector<float>& pts, const float yaw, const float 
         const int sx = int(float(width) * 0.5f + x1 * scale);
         const int sy = int(float(height) * 0.5f - z2 * scale);
         const float depth = std::min(1.f, std::max(0.f, (y2 / radius + 1.f) * 0.5f));
-        Rgba color(0.35f + 0.45f * depth, 0.55f + 0.35f * depth, 1.f, 1.f);
+        double fr = 0.35 + 0.45 * double(depth);
+        double fg = 0.55 + 0.35 * double(depth);
+        double fb = 1.0;
+        filmicApply(fr, fg, fb);
+        Rgba color(float(fr), float(fg), float(fb), 1.f);
         if (g_paletteOn) {
             // 预览与导出共用同一色标函数：这里按深度映射到所选色标
             const double span = (g_paletteMax - g_paletteMin) > 1e-9
@@ -3469,6 +3518,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"buildRochePreset", nullptr, buildRochePreset, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSession", nullptr, setSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setPalette", nullptr, setPalette, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setFilmic", nullptr, setFilmic, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"paletteSample", nullptr, paletteSample, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dumpSettingCatalog", nullptr, dumpSettingCatalog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"nodeSettings", nullptr, nodeSettings, nullptr, nullptr, nullptr, napi_default, nullptr},

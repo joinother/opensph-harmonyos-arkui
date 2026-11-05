@@ -400,6 +400,10 @@ struct ArkMain {
   @State private palMin: number = 0;
   @State private palMax: number = 1;
   private palNames: string[] = ['灰阶', '蓝→红', '维里迪斯', '等离子'];
+  // Filmic 色调映射（第 5 项）
+  @State private filmOn: boolean = false;
+  @State private filmExposure: number = 1.0;
+  @State private filmContrast: number = 1.0;
   private statSeries: number[] = [];
   private statCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private pinchStartZoom: number = 1;
@@ -2387,6 +2391,15 @@ interface Probe {
     return out;
   }
 
+  private applyFilmic(): void {
+    try {
+      ark.setFilmic(this.filmOn, this.filmExposure, this.filmContrast);
+      this.loadPreview();
+    } catch (e) {
+      this.noticeService.error('色调映射设置失败', String(e));
+    }
+  }
+
   private applyPalette(): void {
     try {
       ark.setPalette(this.palKind, this.palMin, this.palMax, this.palOn);
@@ -2442,6 +2455,21 @@ interface Probe {
         .onChange((v: number) => { this.palMin = v; this.applyPalette(); });
       Slider({ value: this.palMax, min: 0, max: 1, step: 0.05 })
         .onChange((v: number) => { this.palMax = v; this.applyPalette(); });
+
+      Divider().color('#eceff3').margin({ top: 4, bottom: 2 });
+      Row() {
+        Text('Filmic 色调映射').fontSize(11).fontColor('#5f6670');
+        Blank();
+        Toggle({ type: ToggleType.Switch, isOn: this.filmOn })
+          .onChange((v: boolean) => { this.filmOn = v; this.applyFilmic(); });
+      }
+      .width('100%');
+      Text(`曝光 ${this.filmExposure.toFixed(2)} · 对比度 ${this.filmContrast.toFixed(2)}`)
+        .fontSize(10).fontColor('#8b929b').width('100%');
+      Slider({ value: this.filmExposure, min: 0.2, max: 3, step: 0.1 })
+        .onChange((v: number) => { this.filmExposure = v; this.applyFilmic(); });
+      Slider({ value: this.filmContrast, min: 0.5, max: 1.8, step: 0.1 })
+        .onChange((v: number) => { this.filmContrast = v; this.applyFilmic(); });
     }
     .width(280)
     .padding(14)
@@ -4539,7 +4567,7 @@ interface Probe {
         })
         .margin({ right: 10 });
       if (this.canvasTab === 1) {
-        Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 20) : '无'} pal=${this.palOn ? 1 : 0}/${this.palKind}/${this.palMin.toFixed(1)}-${this.palMax.toFixed(1)}`)
+        Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 20) : '无'} pal=${this.palOn ? 1 : 0}/${this.palKind} film=${this.filmOn ? 1 : 0}/${this.filmExposure.toFixed(1)}/${this.filmContrast.toFixed(1)}`)
           .fontSize(9)
           .fontColor('#b06000')
           .margin({ left: 8 });
