@@ -2487,6 +2487,7 @@ struct SimState {
     double time = 0;
     long long steps = 0;
     size_t particles = 0;
+    std::string stage = "空闲";   // 运行阶段（界面上直接显示，便于定位卡在哪一步）
     int setUpCount = 0;        // onSetUp 被调用次数（诊断 IC 是否求值）
     int timeStepCount = 0;     // onTimeStep 被调用次数
     // 内核统计量（原先只取 RUN_TIME，这里补齐）
@@ -3093,10 +3094,16 @@ napi_value runSimulation(napi_env env, napi_callback_info info) {
     std::thread worker([node, endTime]() {
         SimState& st = simState();
         SimCallbacks callbacks(st);
+        auto setStage = [&st](const char* s8) {
+            std::lock_guard<std::mutex> lk(st.mutex);
+            st.stage = s8;
+        };
+        setStage("克隆节点树");
         try {
             // 与 wx/CLI 一致：先克隆整棵节点树，再通过 IRunJob::getRun() 取 IRun 运行，
             // 不要在活节点上直接跑（运行期会改写节点内部缓存）。
             SharedPtr<JobNode> clone = cloneHierarchy(*node, String(""));
+            setStage("读取设置");
             RawPtr<IRunJob> runJob = dynamic_cast<IRunJob*>(clone->getJob().get());
             if (!runJob) {
                 throw Exception("节点不是可运行的模拟作业");
@@ -3130,14 +3137,15 @@ napi_value runSimulation(napi_env env, napi_callback_info info) {
                 ns.enumerate(proc);
                 endT = proc.value > 0 ? proc.value : 3600.0;
             }
-            OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHRun",
-                "run end time = %{public}.1f s", endT);
+            setStage("开始运行（求值初始条件）");
             globals.set(RunSettingsId::RUN_END_TIME, Float(endT));
             clone->run(globals, callbacks);
+            setStage("已结束");
             std::lock_guard<std::mutex> lock(st.mutex);
             st.ok = true;
             st.done = true;
         } catch (const std::exception& e) {
+            setStage("异常结束");
             std::lock_guard<std::mutex> lock(st.mutex);
             st.ok = false;
             st.error = String::fromUtf8(e.what()).toUtf8().cstr();
@@ -3264,6 +3272,7 @@ napi_value simulationStatus(napi_env env, napi_callback_info) {
     std::snprintf(dbuf, sizeof(dbuf), ",\"setUpCount\":%d,\"timeStepCount\":%d",
         st.setUpCount, st.timeStepCount);
     json += dbuf;
+    json += ",\"stage\":\"" + jsonEscape(String::fromUtf8(st.stage.c_str())) + "\"";
     json += ",\"recording\":";
     json += st.recActive.load() ? "true" : "false";
     json += ",\"recFrames\":" + std::to_string(st.recFrames);

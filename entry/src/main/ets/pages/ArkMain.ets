@@ -389,6 +389,7 @@ struct ArkMain {
   @State private stOk: boolean = false;
   @State private stError: string = '';
   @State private stSetUp: number = 0;
+  @State private stStage: string = '';
   @State private stTimeSteps: number = 0;
   private lastRunHandle: number = -1;
   private statSeries: number[] = [];
@@ -2320,6 +2321,7 @@ interface Probe {
         particles: number;
         recording: boolean;
         recFrames: number;
+        stage?: string;
         setUpCount?: number;
         timeStepCount?: number;
         wallclock?: number;
@@ -2352,6 +2354,7 @@ interface Probe {
       this.stDone = st.done;
       this.stOk = st.ok;
       this.stError = st.error !== undefined ? st.error : '';
+      this.stStage = st.stage !== undefined ? st.stage : '';
       this.stSetUp = st.setUpCount !== undefined ? st.setUpCount : 0;
       this.stTimeSteps = st.timeStepCount !== undefined ? st.timeStepCount : 0;
       this.stWall = st.wallclock !== undefined ? st.wallclock : 0;
@@ -4077,6 +4080,13 @@ interface Probe {
       .padding({ left: 10, right: 10, top: 4, bottom: 2 });
 
       if (this.statVisible) {
+        if (this.stStage.length > 0 && this.stStage !== '空闲') {
+          Text(`阶段：${this.stStage}`)
+            .fontSize(10)
+            .fontColor('#0b57d0')
+            .width('100%')
+            .padding({ left: 10, bottom: 2 });
+        }
         Row({ space: 14 }) {
           this.statChip('时间 [s]', this.stTime.toFixed(3));
           this.statChip('进度', `${(this.stProgress * 100).toFixed(1)}%`);
