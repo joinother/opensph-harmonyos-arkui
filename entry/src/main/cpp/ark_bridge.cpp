@@ -951,6 +951,127 @@ napi_value setFilmic(napi_env env, napi_callback_info info) {
     return makeString(env, "{\"ok\":true}");
 }
 
+
+// ---- 表达式求值（ChaiScript 的受限替代） ----
+namespace {
+struct ExprParser {
+    const char* p;
+    double x = 0, y = 0, z = 0, t = 0;
+    bool ok = true;
+
+    void skip() { while (*p == ' ' || *p == '\t') ++p; }
+
+    bool eat(char c) { skip(); if (*p == c) { ++p; return true; } return false; }
+
+    double parseExpr() {
+        double v = parseTerm();
+        for (;;) {
+            skip();
+            if (*p == '+') { ++p; v += parseTerm(); }
+            else if (*p == '-') { ++p; v -= parseTerm(); }
+            else return v;
+        }
+    }
+
+    double parseTerm() {
+        double v = parsePower();
+        for (;;) {
+            skip();
+            if (*p == '*') { ++p; v *= parsePower(); }
+            else if (*p == '/') {
+                ++p;
+                const double d = parsePower();
+                if (std::fabs(d) < 1e-300) { ok = false; return 0; }
+                v /= d;
+            } else return v;
+        }
+    }
+
+    double parsePower() {
+        double base = parseUnary();
+        skip();
+        if (*p == '^') { ++p; return std::pow(base, parsePower()); }
+        return base;
+    }
+
+    double parseUnary() {
+        skip();
+        if (*p == '-') { ++p; return -parseUnary(); }
+        if (*p == '+') { ++p; return parseUnary(); }
+        return parseAtom();
+    }
+
+    double parseAtom() {
+        skip();
+        if (eat('(')) {
+            const double v = parseExpr();
+            eat(')');
+            return v;
+        }
+        if (std::isdigit(int(*p)) || *p == '.') {
+            char* end = nullptr;
+            const double v = std::strtod(p, &end);
+            if (end == p) { ok = false; return 0; }
+            p = end;
+            return v;
+        }
+        // 标识符
+        char name[16] = { 0 };
+        int n = 0;
+        while (std::isalpha(int(*p)) && n < 15) { name[n++] = *p++; }
+        if (n == 0) { ok = false; return 0; }
+        const std::string id(name);
+        if (id == "pi") return 3.141592653589793;
+        if (id == "e") return 2.718281828459045;
+        if (id == "x") return x;
+        if (id == "y") return y;
+        if (id == "z") return z;
+        if (id == "t") return t;
+        eat('(');
+        const double a = parseExpr();
+        eat(')');
+        if (id == "sin") return std::sin(a);
+        if (id == "cos") return std::cos(a);
+        if (id == "tan") return std::tan(a);
+        if (id == "sqrt") return a >= 0 ? std::sqrt(a) : (ok = false, 0.0);
+        if (id == "abs") return std::fabs(a);
+        if (id == "exp") return std::exp(a);
+        if (id == "log") return a > 0 ? std::log(a) : (ok = false, 0.0);
+        ok = false;
+        return 0;
+    }
+};
+}  // namespace
+
+/// 计算表达式：支持 + - * / ^ ( )、sin/cos/tan/sqrt/abs/exp/log、变量 x,y,z,t,pi,e
+napi_value evalExpression(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char expr[512] = { 0 };
+    size_t len = 0;
+    if (argc >= 1) {
+        napi_get_value_string_utf8(env, argv[0], expr, sizeof(expr) - 1, &len);
+    }
+    double vars[4] = { 0, 0, 0, 0 };
+    for (size_t i = 1; i < 5 && i < argc; ++i) {
+        napi_get_value_double(env, argv[i], &vars[i - 1]);
+    }
+    ExprParser pr;
+    pr.p = expr;
+    pr.x = vars[0];
+    pr.y = vars[1];
+    pr.z = vars[2];
+    pr.t = vars[3];
+    const double v = pr.parseExpr();
+    if (!pr.ok || !std::isfinite(v)) {
+        return makeString(env, "{\"ok\":false,\"error\":\"表达式无效\"}");
+    }
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "{\"ok\":true,\"value\":%.10g}", v);
+    return makeString(env, buf);
+}
+
 napi_value setPalette(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value argv[4];
@@ -3671,6 +3792,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"buildRochePreset", nullptr, buildRochePreset, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSession", nullptr, setSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setPalette", nullptr, setPalette, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"evalExpression", nullptr, evalExpression, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setFilmic", nullptr, setFilmic, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportMesh", nullptr, exportMesh, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"paletteSample", nullptr, paletteSample, nullptr, nullptr, nullptr, napi_default, nullptr},

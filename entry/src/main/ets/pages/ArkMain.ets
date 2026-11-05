@@ -401,6 +401,9 @@ struct ArkMain {
   @State private stStage: string = '';
   @State private meshInfo: string = '网格：未生成';
   @State private progInfo: string = '进度：无';
+  // 表达式求值（ChaiScript 的受限替代）
+  @State private exprText: string = 'sin(x) + cos(y) * t';
+  @State private exprResult: string = '';
   @State private stRaw: string = '';
   @State private stTimeSteps: number = 0;
   private lastRunHandle: number = -1;
@@ -2757,6 +2760,21 @@ ${circles}
     return out;
   }
 
+  // 调用内核表达式求值器（x,y,z=1.0，t=2.0 作为示例上下文）
+  private evalExpr(): void {
+    try {
+      interface EvalRes {
+        ok: boolean;
+        value?: number;
+        error?: string;
+      }
+      const r: EvalRes = JSON.parse(String(ark.evalExpression(this.exprText, 1.0, 1.0, 1.0, 2.0))) as EvalRes;
+      this.exprResult = r.ok ? `= ${r.value}` : `错误：${r.error ?? ''}`;
+    } catch (e) {
+      this.exprResult = `异常：${String(e)}`;
+    }
+  }
+
   private applyFilmic(): void {
     try {
       ark.setFilmic(this.filmOn, this.filmExposure, this.filmContrast);
@@ -2836,6 +2854,19 @@ ${circles}
         .onChange((v: number) => { this.filmExposure = v; this.applyFilmic(); });
       Slider({ value: this.filmContrast, min: 0.5, max: 1.8, step: 0.1 })
         .onChange((v: number) => { this.filmContrast = v; this.applyFilmic(); });
+
+      Divider().color('#eceff3').margin({ top: 4, bottom: 2 });
+      Text('表达式计算（脚本作业的受限替代）').fontSize(11).fontColor('#5f6670').width('100%');
+      TextInput({ text: this.exprText, placeholder: 'sin(x) + cos(y) * t' })
+        .fontSize(11)
+        .height(32)
+        .onChange((v: string) => { this.exprText = v; });
+      Row({ space: 8 }) {
+        Button('计算').fontSize(11).height(28)
+          .onClick(() => { this.evalExpr(); });
+        Text(this.exprResult).fontSize(10).fontColor('#0b7a33');
+      }
+      .width('100%');
     }
     .width(280)
     .padding(14)
