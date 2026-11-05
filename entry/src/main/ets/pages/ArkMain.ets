@@ -15,6 +15,7 @@ import image from '@ohos.multimedia.image';
 import picker from '@ohos.file.picker';
 import { CursorUtil } from '../common/CursorUtil';
 import { slotLabel } from '../common/SlotLabels';
+import { annotate } from '../common/Glossary';
 import { RemoteServer, RemoteReply, RemoteRequest } from '../common/RemoteServer';
 import { SystemNotifier } from '../common/SystemNotifier';
 
@@ -107,10 +108,10 @@ const CATEGORY_LABEL: Map<string, string> = new Map<string, string>([
 ]);
 
 const NODE_LABEL: Map<string, string> = new Map<string, string>([
-  ['SPH run', 'SPH 模拟'],
-  ['SPH stabilization', 'SPH 稳定化'],
-  ['N-body run', '多体引力模拟'],
-  ['Position based run', '位置约束模拟'],
+  ['SPH run', 'SPH 模拟作业'],
+  ['SPH stabilization', 'SPH 稳定化作业'],
+  ['N-body run', 'N 体模拟作业'],
+  ['Position based run', '位置约束模拟作业'],
   ['sphere', '球体'],
   ['block', '方块'],
   ['ellipsoid', '椭球'],
@@ -372,6 +373,8 @@ struct ArkMain {
   private simTaskId: number = 0;
   private linkDropY: number = 0;
   private cardDragging: boolean = false;
+  // 会话隔离：每个窗口一个 sessionId，内核据此隔离节点表/贴图/天体表
+  private sid: number = 0;
   private pinchStartZoom: number = 1;
   private twoFingerPanX: number = 0;
   private twoFingerPanY: number = 0;
@@ -429,7 +432,7 @@ struct ArkMain {
   @State private exportFrames: number = 120;
   @State private exportQuality: number = 2;
   @State private exportPreset: number = 1;
-  @State private exportName: string = 'opensph-export';
+  @State private exportName: string = '模拟渲染';
   @State private exportRunning: boolean = false;
   @State private exportProgress: number = 0;
   @State private exportStatusText: string = '';
@@ -902,6 +905,16 @@ struct ArkMain {
   }
 
   aboutToAppear(): void {
+    // 会话 id：时间戳低 24 位 + 随机，避免多窗口碰撞
+    if (this.sid === 0) {
+      this.sid = ((Date.now() & 0xFFFFFF) ^ Math.floor(Math.random() * 0xFFFF)) | 0;
+      try {
+        const r: string = String(ark.setSession(this.sid));
+        hilog.info(0x0000, 'OpenSPHSession', `own sid=${this.sid} -> ${r}`);
+      } catch (e) {
+        hilog.warn(0x0000, 'OpenSPHSession', `setSession failed: ${String(e)}`);
+      }
+    }
     this.loadMotionPref();
     setTimeout(() => { this.uploadTexture(this.textureKind); }, 1200);
     setTimeout(() => { this.dumpAllSettingNames(); }, 2500);
@@ -957,7 +970,7 @@ struct ArkMain {
   }
 
   private nodeTitle(className: string): string {
-    return NODE_LABEL.get(className) ?? className;
+    return annotate(NODE_LABEL.get(className) ?? className);
   }
 
   // 一键预设：把「方向/分辨率/帧率/画质/时长」一次配好，省掉逐项点选
@@ -1368,6 +1381,7 @@ interface Probe {
   }
 
   private startSimExportVideo(): void {
+    try { ark.setSession(this.sid); } catch (e) { }
     // 优先走 C++ 原生预设（绕开「按字符串键写设置」不可靠的问题）
     if (this.nodes.length === 0) {
       let runHandle: number = -1;
@@ -2081,7 +2095,7 @@ interface Probe {
     } catch (e) {
       // 目录已存在
     }
-    const safeName: string = this.exportName.length > 0 ? this.exportName : 'opensph-export';
+    const safeName: string = this.exportName.length > 0 ? this.exportName : '模拟渲染';
     const path: string = `${dir}/${safeName}.mp4`;
     if (fs.accessSync(path)) {
       try {
@@ -2566,6 +2580,7 @@ interface Probe {
   }
 
   private addNode(item: JobEntry): void {
+    try { ark.setSession(this.sid); } catch (e) { }
     const offset: number = (this.nodes.length % 6) * 28;
     let handle: number = -1;
     try {
@@ -2754,14 +2769,17 @@ interface Probe {
   }
 
   private settingLabel(name: string): string {
-    return SETTING_LABELS.get(name) ?? SETTING_LABELS_EXTRA.get(name) ?? SETTING_LABEL.get(name) ?? name;
+    const zh: string | undefined = SETTING_LABELS.get(name) ?? SETTING_LABELS_EXTRA.get(name)
+      ?? SETTING_LABEL.get(name);
+    return annotate(zh !== undefined ? zh : name);
   }
 
   private enumOptionLabel(option: SettingOption): string {
     const raw: string = option.label;
     const capitalized: string = raw.length > 0 ? raw.charAt(0).toUpperCase() + raw.slice(1) : raw;
-    return ENUM_LABELS.get(raw) ?? ENUM_LABELS.get(capitalized)
-      ?? ENUM_LABELS_EXTRA.get(raw) ?? ENUM_LABELS_EXTRA.get(capitalized) ?? raw;
+    const zh: string | undefined = ENUM_LABELS.get(raw) ?? ENUM_LABELS.get(capitalized)
+      ?? ENUM_LABELS_EXTRA.get(raw) ?? ENUM_LABELS_EXTRA.get(capitalized);
+    return annotate(zh !== undefined ? zh : raw);
   }
 
   private applySetting(entry: SettingEntry, rawIn: string): void {

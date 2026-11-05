@@ -64,14 +64,15 @@ struct BodyTex {
     int slot;
 };
 static std::vector<BodyTex> g_bodies;
+static thread_local const std::vector<BodyTex>* tlsBodies = nullptr;
+
+// 渲染线程用自己的天体快照，UI 线程用全局
+static const std::vector<BodyTex>& bodyList() {
+    return (tlsBodies != nullptr) ? *tlsBodies : g_bodies;
+}
 
 std::mutex g_texMutex;
 
-// 渲染线程的贴图快照（thread_local）：导出任务启动时绑定自己的快照，
-// 这样多个任务并发渲染时互不影响；UI 线程为空则用全局贴图。
-static thread_local const std::vector<uint8_t>* tlsTexSnap[kMaxTex] = { nullptr };
-static thread_local int tlsTexW[kMaxTex] = { 0 };
-static thread_local int tlsTexH[kMaxTex] = { 0 };
 
 static void setTextureData(const int slot, const int w, const int h, const uint8_t* src) {
     std::lock_guard<std::mutex> gl(g_texMutex);
@@ -85,6 +86,12 @@ static void setTextureData(const int slot, const int w, const int h, const uint8
     g_texW[i] = w;
     g_texH[i] = h;
 }
+
+// 渲染线程的贴图快照（thread_local）：导出任务启动时绑定自己的快照，
+// 多个任务并发渲染时互不影响；UI 线程为空则用全局贴图。
+static thread_local const std::vector<uint8_t>* tlsTexSnap[kMaxTex] = { nullptr };
+static thread_local int tlsTexW[kMaxTex] = { 0 };
+static thread_local int tlsTexH[kMaxTex] = { 0 };
 
 /// 双线性采样；返回 false 表示没有纹理
 static bool sampleTexture(const int slot, const double u, const double v,
@@ -319,18 +326,18 @@ static void splatPoints(const std::vector<float>& pts,
         }
         int grp = gcnt[1] > 0 ? (grpAxis >= 0 ? 1 : 0) : 0;
         int slot = grp == 1 ? 1 : 0;
-        if (!g_bodies.empty()) {
+        if (!bodyList().empty()) {
             // 按「离哪个天体最近（用 r 归一化）」决定归属，支持任意天体数
             double best = 1e300;
-            for (size_t bi = 0; bi < g_bodies.size(); ++bi) {
-                const double ddx = pts[k * 3] - g_bodies[bi].cx;
-                const double ddy = pts[k * 3 + 1] - g_bodies[bi].cy;
-                const double ddz = pts[k * 3 + 2] - g_bodies[bi].cz;
-                const double norm = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz) / std::max(1.0, g_bodies[bi].r);
+            for (size_t bi = 0; bi < bodyList().size(); ++bi) {
+                const double ddx = pts[k * 3] - bodyList()[bi].cx;
+                const double ddy = pts[k * 3 + 1] - bodyList()[bi].cy;
+                const double ddz = pts[k * 3 + 2] - bodyList()[bi].cz;
+                const double norm = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz) / std::max(1.0, bodyList()[bi].r);
                 if (norm < best) {
                     best = norm;
                     grp = int(bi);
-                    slot = g_bodies[bi].slot;
+                    slot = bodyList()[bi].slot;
                 }
             }
         }
@@ -464,18 +471,18 @@ static void splatPoints(const std::vector<float>& pts,
         double gsx[kMaxBody] = { cxPix, cxPix, cxPix, cxPix, cxPix, cxPix, cxPix, cxPix };
         double gsy[kMaxBody] = { cyPix, cyPix, cyPix, cyPix, cyPix, cyPix, cyPix, cyPix };
         double gsr[kMaxBody] = { rPix, rPix, rPix, rPix, rPix, rPix, rPix, rPix };
-        const int bodyCnt = g_bodies.empty() ? 2 : std::min<int>(kMaxBody, int(g_bodies.size()));
+        const int bodyCnt = bodyList().empty() ? 2 : std::min<int>(kMaxBody, int(bodyList().size()));
         for (int g = 0; g < bodyCnt; ++g) {
-            const double wx = (g_bodies.empty() ? gcx[g] : g_bodies[g].cx) - cx;
-            const double wy = (g_bodies.empty() ? gcy[g] : g_bodies[g].cy) - cy;
-            const double wz = (g_bodies.empty() ? gcz[g] : g_bodies[g].cz) - cz;
+            const double wx = (bodyList().empty() ? gcx[g] : bodyList()[g].cx) - cx;
+            const double wy = (bodyList().empty() ? gcy[g] : bodyList()[g].cy) - cy;
+            const double wz = (bodyList().empty() ? gcz[g] : bodyList()[g].cz) - cz;
             const double x1g = wx * ca - wy * sa;
             const double y1g = wx * sa + wy * ca;
             const double y2g = y1g * ct - wz * st;
             const double z2g = y1g * st + wz * ct;
             gsx[g] = double(W) * 0.5 + x1g * scale;
             gsy[g] = double(H) * 0.5 - z2g * scale;
-            gsr[g] = std::max(1.0, (g_bodies.empty() ? grd[g] : g_bodies[g].r) * scale);
+            gsr[g] = std::max(1.0, (bodyList().empty() ? grd[g] : bodyList()[g].r) * scale);
         }
         // 相机空间法线 → 物体空间（恢复纹理随天体旋转的正确 UV）
         auto camToBody = [&](double nx, double ny, double nz, double& bx, double& by, double& bz) {
@@ -626,6 +633,65 @@ napi_value makeString(napi_env env, const std::string& text) {
 std::map<int, SharedPtr<JobNode>>& nodeRegistry() {
     static std::map<int, SharedPtr<JobNode>> registry;
     return registry;
+}
+
+// ---------------------------------------------------------------------------
+// 会话隔离：每个窗口一个 session，各自拥有节点表 / 贴图 / 天体表。
+// ArkTS 切换窗口时调用 ark.setSession(id)，这里把全局数据与目标会话互换，
+// 因此既有 API 无需改签名即可按窗口隔离。
+// ---------------------------------------------------------------------------
+struct Session {
+    std::map<int, SharedPtr<JobNode>> nodes;
+    std::vector<uint8_t> tex[kMaxTex];
+    int texW[kMaxTex] = { 0 };
+    int texH[kMaxTex] = { 0 };
+    std::vector<BodyTex> bodies;
+};
+
+static std::map<int, Session> g_sessions;
+static int g_activeSid = 0;
+
+static Session& activeSession() {
+    return g_sessions[g_activeSid];
+}
+
+napi_value setSession(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t want = 0;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &want);
+    }
+    if (want == g_activeSid) {
+        return makeString(env, "{\"ok\":true,\"sid\":" + std::to_string(want)
+            + ",\"nodes\":" + std::to_string(nodeRegistry().size()) + "}");
+    }
+    {
+        Session& old = activeSession();
+        old.nodes.swap(nodeRegistry());
+        for (int i = 0; i < kMaxTex; ++i) {
+            old.tex[i].swap(g_tex[i]);
+            old.texW[i] = g_texW[i];
+            old.texH[i] = g_texH[i];
+        }
+        old.bodies.swap(g_bodies);
+    }
+    g_activeSid = want;
+    {
+        Session& cur = activeSession();
+        cur.nodes.swap(nodeRegistry());
+        for (int i = 0; i < kMaxTex; ++i) {
+            cur.tex[i].swap(g_tex[i]);
+            g_texW[i] = cur.texW[i];
+            g_texH[i] = cur.texH[i];
+        }
+        cur.bodies.swap(g_bodies);
+    }
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHSession",
+        "switch sid=%{public}d nodes=%{public}zu", want, nodeRegistry().size());
+    return makeString(env, "{\"ok\":true,\"sid\":" + std::to_string(want)
+        + ",\"nodes\":" + std::to_string(nodeRegistry().size()) + "}");
 }
 
 int nextNodeHandle = 1;
@@ -2210,13 +2276,13 @@ napi_value setBodyTextures(napi_env env, napi_callback_info info) {
             break;
         }
         pos = close + 1;
-        if (g_bodies.size() >= 8) {
+        if (bodyList().size() >= 8) {
             break;
         }
     }
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHBody",
-        "setBodyTextures count=%{public}zu", g_bodies.size());
-    return makeString(env, "{\"ok\":true,\"count\":" + std::to_string(g_bodies.size()) + "}");
+        "setBodyTextures count=%{public}zu", bodyList().size());
+    return makeString(env, "{\"ok\":true,\"count\":" + std::to_string(bodyList().size()) + "}");
 }
 
 napi_value listJobGraph(napi_env env, napi_callback_info) {
@@ -2798,11 +2864,6 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
     // 快照当前贴图与天体表（全局写入可能来自 UI 线程，需加锁）
     {
 
-// 渲染线程的贴图快照（thread_local）：导出任务启动时绑定自己的快照，
-// 这样多个任务并发渲染时互不影响；UI 线程为空则用全局贴图。
-static thread_local const std::vector<uint8_t>* tlsTexSnap[kMaxTex] = { nullptr };
-static thread_local int tlsTexW[kMaxTex] = { 0 };
-static thread_local int tlsTexH[kMaxTex] = { 0 };
         std::lock_guard<std::mutex> gl(g_texMutex);
         for (int i = 0; i < kMaxTex; ++i) {
             taskState->texSnap[i] = g_tex[i];
@@ -2827,6 +2888,7 @@ static thread_local int tlsTexH[kMaxTex] = { 0 };
             tlsTexW[ti] = taskState->texSnapW[ti];
             tlsTexH[ti] = taskState->texSnapH[ti];
         }
+        tlsBodies = &taskState->bodySnap;
         SimExportState& st = *taskState;
         VideoWriter writer;
         VideoParams params;
@@ -3177,6 +3239,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"jobCatalog", nullptr, jobCatalog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"createNode", nullptr, createNode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"buildRochePreset", nullptr, buildRochePreset, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setSession", nullptr, setSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dumpSettingCatalog", nullptr, dumpSettingCatalog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"nodeSettings", nullptr, nodeSettings, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setNodeSetting", nullptr, setNodeSetting, nullptr, nullptr, nullptr, napi_default, nullptr},

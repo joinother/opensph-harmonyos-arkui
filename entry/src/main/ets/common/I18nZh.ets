@@ -117,6 +117,7 @@ export const SETTING_LABELS: Map<string, string> = new Map<string, string>([
 ]);
 
 export const CATEGORY_LABELS: Map<string, string> = new Map<string, string>([
+  ["Hubbard & MacFarlane", 'Hubbard & MacFarlane 物态方程（木星型行星内部模型）'],
   ['ANEOS', 'ANEOS'],
   ['Aggregates (experimental)', '聚合体（实验）'],
   ['Animation', '动画'],
@@ -369,7 +370,7 @@ export const SETTING_LABELS_EXTRA: Map<string, string> = new Map<string, string>
   ['Halo particle count', '晕粒子数'],
   ['Halo scale length', '晕尺度长度'],
   ['Particle radius', '粒子半径'],
-  ['Toomre Q parameter', 'Toomre Q 参数'],
+  ['Toomre Q parameter', 'Toomre Q 参数（盘不稳定性判据）'],
   ['unnamed sphere', '未命名球体'],
   ['unnamed galaxy ICs', '未命名星系初态'],
   ['unnamed collision', '未命名对撞'],
