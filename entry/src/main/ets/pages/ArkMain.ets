@@ -1884,6 +1884,130 @@ interface Probe {
     }
   }
 
+  // 静帧导出：PNG（走系统保存面板）
+  private async exportStillPng(): Promise<void> {
+    const handle: number = this.selectedNode >= 0 ? (this.nodeById(this.selectedNode)?.handle ?? -1) : -1;
+    if (handle < 0) {
+      this.noticeService.warn('无法导出静帧', '先选中一个节点');
+      return;
+    }
+    try {
+      // 内核渲染接口对尺寸有上限，这里与预览一致用 1000×1000
+      let W: number = 1920;
+      let H: number = 1080;
+      let buf: ArrayBuffer = ark.renderSplat(handle, this.yaw, this.pitch, W, H) as ArrayBuffer;
+      if (buf === undefined || buf === null || buf.byteLength !== W * H * 4) {
+        W = 1000;
+        H = 1000;
+        buf = ark.renderSplat(handle, this.yaw, this.pitch, W, H) as ArrayBuffer;
+      }
+      if (buf === undefined || buf === null || buf.byteLength !== W * H * 4) {
+        this.noticeService.error('导出失败', '渲染缓冲无效');
+        return;
+      }
+      const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+      opts.newFileNames = [`静帧-${Date.now()}.png`];
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const pickerInst: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+      const uris: string[] = await pickerInst.save(opts);
+      if (uris.length === 0) {
+        return;
+      }
+      const f: fs.File = fs.openSync(uris[0], fs.OpenMode.READ_WRITE);
+      const pmOpts: image.InitializationOptions = {
+        size: { width: W, height: H },
+        pixelFormat: image.PixelMapFormat.RGBA_8888,
+        editable: false
+      };
+      const pm: image.PixelMap = image.createPixelMapSync(buf, pmOpts);
+      const packer: image.ImagePacker = image.createImagePacker();
+      const packOpts: image.PackingOption = { format: 'image/png', quality: 100 };
+      await packer.packToFile(pm, f.fd, packOpts);
+      fs.closeSync(f);
+      this.noticeService.success('静帧已保存', `${W}×${H} PNG`);
+    } catch (e) {
+      this.noticeService.error('导出静帧失败', String(e));
+    }
+  }
+
+  // 静帧导出：SVG（把当前视角的粒子投影成矢量圆点）
+  private async exportStillSvg(): Promise<void> {
+    const handle: number = this.selectedNode >= 0 ? (this.nodeById(this.selectedNode)?.handle ?? -1) : -1;
+    if (handle < 0) {
+      this.noticeService.warn('无法导出静帧', '先选中一个节点');
+      return;
+    }
+    try {
+      interface PreviewData {
+        points?: number[];
+        bounds?: number[];
+        count?: number;
+      }
+      const raw: string = String(ark.previewPoints(handle, 4000));
+      const data: PreviewData = JSON.parse(raw) as PreviewData;
+      const pts: number[] = data.points ?? [];
+      const b: number[] = data.bounds ?? [0, 0, 0, 0, 0, 0];
+      if (pts.length < 3) {
+        this.noticeService.error('导出失败', '该节点没有可导出的点');
+        return;
+      }
+      const cx: number = (b[0] + b[3]) / 2;
+      const cy: number = (b[1] + b[4]) / 2;
+      const cz: number = (b[2] + b[5]) / 2;
+      let radius: number = 0.0001;
+      for (let i = 0; i < pts.length; i += 3) {
+        const dx: number = pts[i] - cx;
+        const dy: number = pts[i + 1] - cy;
+        const dz: number = pts[i + 2] - cz;
+        const d: number = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d > radius) {
+          radius = d;
+        }
+      }
+      const W: number = 1000;
+      const H: number = 1000;
+      const scale: number = Math.min(W, H) * 0.42 / radius;
+      const ca: number = Math.cos(this.yaw);
+      const sa: number = Math.sin(this.yaw);
+      const ct: number = Math.cos(this.pitch);
+      const st: number = Math.sin(this.pitch);
+      let circles: string = '';
+      for (let i = 0; i < pts.length; i += 3) {
+        const x0: number = pts[i] - cx;
+        const y0: number = pts[i + 1] - cy;
+        const z0: number = pts[i + 2] - cz;
+        const x1: number = x0 * ca - y0 * sa;
+        const y1: number = x0 * sa + y0 * ca;
+        const y2: number = y1 * ct - z0 * st;
+        const z2: number = y1 * st + z0 * ct;
+        const sx: number = W * 0.5 + x1 * scale;
+        const sy: number = H * 0.5 - z2 * scale;
+        const depth: number = Math.min(1, Math.max(0, (y2 / radius + 1) / 2));
+        const l: number = Math.round(90 + 140 * depth);
+        circles += `<circle cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="${(2.0 + 1.6 * depth).toFixed(2)}" fill="rgb(${Math.round(l * 0.45)},${Math.round(l * 0.62)},${l})"/>`;
+      }
+      const svg: string = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+<rect width="${W}" height="${H}" fill="#161a1f"/>
+${circles}
+</svg>`;
+      const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+      opts.newFileNames = [`静帧-${Date.now()}.svg`];
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const pickerInst: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+      const uris: string[] = await pickerInst.save(opts);
+      if (uris.length === 0) {
+        return;
+      }
+      const f: fs.File = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(f.fd, svg);
+      fs.closeSync(f);
+      this.noticeService.success('SVG 已保存', `${pts.length / 3} 个矢量点`);
+    } catch (e) {
+      this.noticeService.error('导出 SVG 失败', String(e));
+    }
+  }
+
   private async saveVideoToUser(devicePath: string, name: string): Promise<void> {
     try {
       const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
@@ -4645,6 +4769,16 @@ interface Probe {
   @Builder
   previewPane() {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 静帧导出（浮动，右上角）
+      Row({ space: 8 }) {
+        Button('导出静帧 PNG').fontSize(11).height(28)
+          .onClick(() => { this.exportStillPng(); });
+        Button('SVG').fontSize(11).height(28)
+          .onClick(() => { this.exportStillSvg(); });
+      }
+      .position({ x: 300, y: 10 })
+      .zIndex(9);
+
       // 相机预设 + 惯性（浮动，右上角）
       Row({ space: 8 }) {
         Select([{ value: this.camNames[0] }, { value: this.camNames[1] },
