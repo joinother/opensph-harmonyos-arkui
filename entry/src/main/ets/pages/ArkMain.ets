@@ -313,6 +313,15 @@ function menuStyle() {
   })
 }
 
+interface ExportProgress {
+  width: number;
+  height: number;
+  fps: number;
+  frames: number;
+  done: number;
+  duration: number;
+}
+
 @Entry
 @Component
 struct ArkMain {
@@ -394,6 +403,8 @@ struct ArkMain {
   @State private stRaw: string = '';
   @State private stTimeSteps: number = 0;
   private lastRunHandle: number = -1;
+  private expFrames: number = 0;
+  private expDuration: number = 0;
   // 调色板（第 4 项）
   @State private palOpen: boolean = false;
   @State private palOn: boolean = false;
@@ -2010,6 +2021,74 @@ ${circles}
   }
 
   // 网格导出：先生成到沙箱（耗时操作不依赖前台），成功后再弹保存面板复制
+  // ---- 分段续渲（第 9 项）----
+  private progressPath(): string {
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    return `${ctx.filesDir}/export-progress.json`;
+  }
+
+  private readProgress(): ExportProgress | null {
+    try {
+      const p: string = this.progressPath();
+      if (!fs.accessSync(p)) {
+        return null;
+      }
+      const txt: string = fs.readTextSync(p);
+      return JSON.parse(txt) as ExportProgress;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  private writeProgress(p: ExportProgress): void {
+    try {
+      const f: fs.File = fs.openSync(this.progressPath(),
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(f.fd, JSON.stringify(p));
+      fs.closeSync(f);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // 续渲：读进度文件，从已完成帧继续，输出到新分段
+  private resumeExport(): void {
+    const prog: ExportProgress | null = this.readProgress();
+    if (prog === null) {
+      this.noticeService.warn('没有可续渲的进度', '先正常导出一段（中途停止也可）');
+      return;
+    }
+    if (prog.done <= 0 || prog.done >= prog.frames) {
+      this.noticeService.info('无需续渲', `上次已完成 ${prog.done}/${prog.frames} 帧`);
+      return;
+    }
+    try {
+      ark.setSession(this.sid);
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const outPath: string = `${ctx.filesDir}/videos/opensph-续渲-${prog.done}.mp4`;
+      interface StartRes {
+        ok: boolean;
+        taskId?: number;
+        frames?: number;
+        error?: string;
+      }
+      const opts: string = `{"width":${prog.width},"height":${prog.height},"fps":${prog.fps}`
+        + `,"frames":${prog.frames},"duration":${prog.duration},"path":"${outPath}"`
+        + `,"startFrame":${prog.done}}`;
+      const res: StartRes = JSON.parse(String(ark.startSimExport(this.lastRunHandle, opts))) as StartRes;
+      if (!res.ok) {
+        this.noticeService.error('无法续渲', res.error ?? '');
+        return;
+      }
+      this.simTaskId = res.taskId ?? -1;
+      this.expFrames = res.frames ?? 0;
+      this.noticeService.success('已开始续渲',
+        `从第 ${prog.done}/${prog.frames} 帧继续（输出分段文件）`);
+    } catch (e) {
+      this.noticeService.error('无法续渲', String(e));
+    }
+  }
+
   // 网格导出：内核只产出网格文本，写文件交给 ArkTS（绕开内核写盘崩溃）
   private async exportMeshFile(ext: string): Promise<void> {
     let handle: number = -1;
@@ -2826,6 +2905,27 @@ ${circles}
       }
       if (this.simRecording) {
         this.simRecFrames = st.recFrames;
+      }
+      // 续渲进度：把已完成帧持久化，供中断后继续
+      if (this.simTaskId >= 0 && this.expFrames > 0) {
+        try {
+          interface ExpStat {
+            rendered?: number;
+            failed?: boolean;
+            active?: boolean;
+            error?: string;
+          }
+          const es: ExpStat = JSON.parse(String(ark.simExportStatus(this.simTaskId))) as ExpStat;
+          const done: number = es.rendered ?? 0;
+          if (done > 0) {
+            this.writeProgress({
+              width: 1920, height: 1080, fps: 60, frames: this.expFrames,
+              done: done, duration: this.expDuration
+            });
+          }
+        } catch (e) {
+          // ignore
+        }
       }
       if (st.running) {
         hilog.info(0x0000, 'OpenSPHSim', `tick t=${st.time} steps=${st.steps} particles=${st.particles} tab=${this.canvasTab}`);
@@ -3985,7 +4085,7 @@ ${circles}
       }
     } else if (name === '渲染') {
       if (index === 6) {
-        this.exportMeshFile('obj');
+        this.resumeExport();
         return;
       }
       if (index === 4) {
@@ -4039,7 +4139,7 @@ ${circles}
         this.simRecording ? '停止录制' : '录制过程', '自检（IC+模拟）', '运行当前场景（自动定位运行节点）', '诊断：静默运行（最小回调）'];
     }
     if (name === '渲染') {
-      return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）', '导出网格 OBJ', '导出网格 PLY', '生成网格到沙箱（诊断）'];
+      return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）', '导出网格 OBJ', '导出网格 PLY', '继续上次渲染（续渲）'];
     }
     return ['自检', '关于'];
   }

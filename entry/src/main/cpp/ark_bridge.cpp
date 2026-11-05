@@ -3076,12 +3076,15 @@ private:
     const int height;
     const int total;
     const double dt;
+    const int startFrame = 0;   // 续渲：跳过前 startFrame 帧（只推进时间轴，不编码）
+    int skippedFrames = 0;
     double nextFrameTime = 0;
 
 public:
     SimExportCallbacks(SimExportState& state, VideoWriter& writer, const int w, const int h,
-        const int total, const double duration)
+        const int total, const double duration, const int startFrame)
         : state(state), writer(writer), width(w), height(h), total(total),
+          startFrame(startFrame),
           dt(duration > 0 ? duration / double(std::max(1, total)) : 1.0 / 60.0) {}
 
     virtual void onStart(const IJob&) override {}
@@ -3121,7 +3124,12 @@ public:
             } catch (...) {
                 return;
             }
-            const int f = state.rendered.load();
+            if (skippedFrames < startFrame) {
+                skippedFrames += 1;
+                nextFrameTime += dt;
+                continue;    // 续渲：已完成的帧不再重复编码
+            }
+            const int f = state.rendered.load() + startFrame;
             const double yaw = 0.35 + 0.25 * double(f) / double(std::max(1, total));
             String err;
             if (!renderSimFrame(pts, yaw, 0.42, width, height, writer, err)) {
@@ -3198,6 +3206,7 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
     const int height = std::max(64, std::min(readInt("height", 1080), 2160));
     const int fps = std::max(1, std::min(readInt("fps", 60), 60));
     const int total = std::max(1, std::min(readInt("frames", 300), 3600));
+    const int startFrame = std::max(0, std::min(readInt("startFrame", 0), total - 1));
     const int bitrate = std::max(1000000, readInt("bitrate", 20000000));
     double duration = 0;
     {
@@ -3249,7 +3258,7 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
         taskState->error.clear();
     }
 
-    std::thread worker([node, width, height, fps, total, bitrate, duration, path, taskState]() {
+    std::thread worker([node, width, height, fps, total, bitrate, duration, path, taskState, startFrame]() {
         g_tlsState = taskState.get();      // 绑定本线程的任务状态
         for (int ti = 0; ti < kMaxTex; ++ti) {
             tlsTexSnap[ti] = &taskState->texSnap[ti];
@@ -3283,7 +3292,7 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
             globals.set(RunSettingsId::RUN_RNG, RngEnum::UNIFORM);
             globals.set(RunSettingsId::RUN_RNG_SEED, 1234);
             globals.set(RunSettingsId::RUN_END_TIME, Float(duration));
-            SimExportCallbacks callbacks(st, writer, width, height, total, duration);
+            SimExportCallbacks callbacks(st, writer, width, height, total, duration, startFrame);
             clone->run(globals, callbacks);
             if (!st.failed.load()) {
                 String closeError;
