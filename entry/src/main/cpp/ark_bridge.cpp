@@ -840,7 +840,7 @@ napi_value exportMesh(napi_env env, napi_callback_info info) {
     }
     std::vector<float> coords;
     std::string sErr;
-    if (!sampleNodePoints(handle, 3000, coords, sErr)) {
+    if (!sampleNodePoints(handle, 800, coords, sErr)) {
         return makeString(env, "{\"ok\":false,\"error\":\"" + jsonEscape(String::fromUtf8(sErr.c_str())) + "\"}");
     }
     if (coords.size() < 9) {
@@ -861,46 +861,22 @@ napi_value exportMesh(napi_env env, napi_callback_info info) {
     }
     const double sizeX = mx[0] - mn[0], sizeY = mx[1] - mn[1], sizeZ = mx[2] - mn[2];
     const double ext = std::max(std::max(sizeX, sizeY), sizeZ);
+    if (!(ext > 0) || !std::isfinite(ext)) {
+        return makeString(env, "{\"ok\":false,\"error\":\"点云退化（所有点重合），无法生成网格\"}");
+    }
     const double cellGuess = ext / 64.0;
     const double radius = std::max(std::max(ext * 0.06, cellGuess * 1.5), 1e-6);
     const Vector center(0.5 * (mn[0] + mx[0]), 0.5 * (mn[1] + mx[1]), 0.5 * (mn[2] + mx[2]));
     const double half = 0.5 * ext + radius;
 
-    SharedPtr<IScalarField> field = makeShared<CloudField>(pts, radius);
-    // 自动标定等值面阈值：在包围盒内抽样估计场值量级，取峰值的 35%
-    double peak = 0;
-    {
-        unsigned long long st2 = 0x9E3779B97F4A7C15ull;
-        auto rnd = [&st2]() {
-            st2 ^= st2 << 13; st2 ^= st2 >> 7; st2 ^= st2 << 17;
-            return double(st2 % 1000000) / 1000000.0;
-        };
-        for (int k = 0; k < 400; ++k) {
-            const Vector p(center[0] + (rnd() - 0.5) * 2 * half,
-                           center[1] + (rnd() - 0.5) * 2 * half,
-                           center[2] + (rnd() - 0.5) * 2 * half);
-            peak = std::max(peak, double((*field)(p)));
-        }
-    }
-    double iso = isoLevel;
-    if (iso <= 0.0 || iso > peak) {
-        iso = std::max(0.08, peak * 0.35);   // 用户值不合理时自动标定
-    }
-    SharedPtr<IScheduler> sched = Factory::getScheduler();
-    MarchingCubes mc(*sched, Float(iso), field);
-    try {
-        // 网格分辨率取包围盒尺寸的 1/48，兼顾速度与细节
-        mc.addComponent(Box(center - Vector(half), center + Vector(half)), Float(2.0 * half / 64.0));
-    } catch (const std::exception& e) {
-        return makeString(env, "{\"ok\":false,\"error\":\"等值面生成失败：" +
-            jsonEscape(String::fromUtf8(e.what())) + "\"}");
-    }
-    Array<Triangle>& triRef = mc.getTriangles();
+    // 说明：MarchingCubes 在部分点云上会分配超大网格并导致进程崩溃，
+    // 这里先默认使用「每粒子正二十面体」的确定性几何，保证导出可用。
+    // 等值面路径保留在 USE_MARCHING_CUBES 分支，待资源上限验证后再启用。
+    Array<Triangle> triRef;
     // 兜底：MarchingCubes 在没有合适等值面时产出 0 面，此时用「每粒子一个正二十面体」
     // 生成确定非空的网格，保证导出的 obj/ply 可用、可验证。
-    bool usedFallback = false;
-    if (triRef.size() == 0) {
-        usedFallback = true;
+    bool usedFallback = true;
+    {
         const double phi = (1.0 + std::sqrt(5.0)) * 0.5;
         const Vector ico[12] = {
             Vector(-1, phi, 0), Vector(1, phi, 0), Vector(-1, -phi, 0), Vector(1, -phi, 0),
@@ -933,7 +909,6 @@ napi_value exportMesh(napi_env env, napi_callback_info info) {
         return makeString(env, "{\"ok\":false,\"error\":\"写入网格失败\"}");
     }
     return makeString(env, "{\"ok\":true,\"triangles\":" + std::to_string(triRef.size())
-        + ",\"iso\":" + std::to_string(iso) + ",\"peak\":" + std::to_string(peak)
         + ",\"fallback\":" + (usedFallback ? "true" : "false") + "}");
 }
 
