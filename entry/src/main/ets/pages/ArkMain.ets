@@ -966,7 +966,9 @@ struct ArkMain {
   }
 
   private label(category: string): string {
-    return CATEGORY_LABEL.get(category) ?? category;
+    // 先用画布精简表，再回落到完整分类表（71 条），避免露出英文类名
+    const zh: string | undefined = CATEGORY_LABEL.get(category) ?? CATEGORY_LABELS.get(category);
+    return annotate(zh !== undefined ? zh : category);
   }
 
   private nodeTitle(className: string): string {

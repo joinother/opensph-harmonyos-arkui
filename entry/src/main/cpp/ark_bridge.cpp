@@ -640,12 +640,18 @@ std::map<int, SharedPtr<JobNode>>& nodeRegistry() {
 // ArkTS 切换窗口时调用 ark.setSession(id)，这里把全局数据与目标会话互换，
 // 因此既有 API 无需改签名即可按窗口隔离。
 // ---------------------------------------------------------------------------
+struct SimExportState;
+
+// 当前会话的渲染任务表（切换会话时与 Session::tasks 互换）
+static std::vector<std::shared_ptr<SimExportState>> g_tasks;
+
 struct Session {
     std::map<int, SharedPtr<JobNode>> nodes;
     std::vector<uint8_t> tex[kMaxTex];
     int texW[kMaxTex] = { 0 };
     int texH[kMaxTex] = { 0 };
     std::vector<BodyTex> bodies;
+    std::vector<std::shared_ptr<SimExportState>> tasks;   // 本会话的渲染任务
 };
 
 static std::map<int, Session> g_sessions;
@@ -676,6 +682,7 @@ napi_value setSession(napi_env env, napi_callback_info info) {
             old.texH[i] = g_texH[i];
         }
         old.bodies.swap(g_bodies);
+        old.tasks.swap(g_tasks);
     }
     g_activeSid = want;
     {
@@ -687,6 +694,7 @@ napi_value setSession(napi_env env, napi_callback_info info) {
             g_texH[i] = cur.texH[i];
         }
         cur.bodies.swap(g_bodies);
+        cur.tasks.swap(g_tasks);
     }
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHSession",
         "switch sid=%{public}d nodes=%{public}zu", want, nodeRegistry().size());
@@ -2615,7 +2623,6 @@ static const int kPrevH = 270;
 
 // 多任务：每个导出任务一份独立状态；工作线程用 thread_local 绑定自己的那份，
 // UI 线程按 taskId 从任务表里取。
-static std::vector<std::shared_ptr<SimExportState>> g_tasks;
 static std::mutex g_taskMtx;
 static int g_nextTaskId = 1;
 static thread_local SimExportState* g_tlsState = nullptr;
