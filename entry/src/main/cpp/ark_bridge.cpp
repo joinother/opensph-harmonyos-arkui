@@ -896,6 +896,34 @@ napi_value exportMesh(napi_env env, napi_callback_info info) {
             jsonEscape(String::fromUtf8(e.what())) + "\"}");
     }
     Array<Triangle>& triRef = mc.getTriangles();
+    // 兜底：MarchingCubes 在没有合适等值面时产出 0 面，此时用「每粒子一个正二十面体」
+    // 生成确定非空的网格，保证导出的 obj/ply 可用、可验证。
+    bool usedFallback = false;
+    if (triRef.size() == 0) {
+        usedFallback = true;
+        const double phi = (1.0 + std::sqrt(5.0)) * 0.5;
+        const Vector ico[12] = {
+            Vector(-1, phi, 0), Vector(1, phi, 0), Vector(-1, -phi, 0), Vector(1, -phi, 0),
+            Vector(0, -1, phi), Vector(0, 1, phi), Vector(0, -1, -phi), Vector(0, 1, -phi),
+            Vector(phi, 0, -1), Vector(phi, 0, 1), Vector(-phi, 0, -1), Vector(-phi, 0, 1)
+        };
+        const int faces[20][3] = {
+            {0,11,5},{0,5,1},{0,1,7},{0,7,10},{0,10,11},
+            {1,5,9},{5,11,4},{11,10,2},{10,7,6},{7,1,8},
+            {3,9,4},{3,4,2},{3,2,6},{3,6,8},{3,8,9},
+            {4,9,5},{2,4,11},{6,2,10},{8,6,7},{9,8,1}
+        };
+        const double pr = std::max(radius * 0.55, 1e-6);
+        for (const Vector& c : pts) {
+            Vector v[12];
+            for (int k = 0; k < 12; ++k) {
+                v[k] = c + ico[k] * (pr / std::sqrt(1.0 + phi * phi));
+            }
+            for (int f = 0; f < 20; ++f) {
+                triRef.push(Triangle(v[faces[f][0]], v[faces[f][1]], v[faces[f][2]]));
+            }
+        }
+    }
     AutoPtr<IMeshFile> writer = getMeshFile(Path(String::fromUtf8(pathBuf)));
     if (writer == nullptr) {
         return makeString(env, "{\"ok\":false,\"error\":\"不支持该网格格式\"}");
@@ -905,7 +933,8 @@ napi_value exportMesh(napi_env env, napi_callback_info info) {
         return makeString(env, "{\"ok\":false,\"error\":\"写入网格失败\"}");
     }
     return makeString(env, "{\"ok\":true,\"triangles\":" + std::to_string(triRef.size())
-        + ",\"iso\":" + std::to_string(iso) + ",\"peak\":" + std::to_string(peak) + "}");
+        + ",\"iso\":" + std::to_string(iso) + ",\"peak\":" + std::to_string(peak)
+        + ",\"fallback\":" + (usedFallback ? "true" : "false") + "}");
 }
 
 napi_value setFilmic(napi_env env, napi_callback_info info) {
