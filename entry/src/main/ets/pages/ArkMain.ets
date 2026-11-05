@@ -2008,43 +2008,47 @@ ${circles}
     }
   }
 
-  // 网格导出：等值面 → obj / ply（走系统保存面板）
+  // 网格导出：先生成到沙箱（耗时操作不依赖前台），成功后再弹保存面板复制
   private async exportMeshFile(ext: string): Promise<void> {
     const handle: number = this.selectedNode >= 0 ? (this.nodeById(this.selectedNode)?.handle ?? -1) : -1;
     if (handle < 0) {
       this.noticeService.warn('无法导出网格', '先选中一个节点');
       return;
     }
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    const sandbox: string = `${ctx.filesDir}/export.${ext}`;
     try {
+      // 1) 先做重活：采样 + 等值面/兜底网格 + 写沙箱
+      this.noticeService.info('正在生成网格…', '完成后会弹出保存位置');
+      interface MeshResult {
+        ok: boolean;
+        triangles?: number;
+        error?: string;
+        fallback?: boolean;
+      }
+      const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, sandbox, 0))) as MeshResult;
+      if (!res.ok) {
+        this.noticeService.error('生成网格失败', res.error ?? '');
+        return;
+      }
+      const st: fs.Stat = fs.statSync(sandbox);
+      if (st.size <= 0) {
+        this.noticeService.error('网格为空',
+          `三角面 ${res.triangles ?? 0} 个 · 文件 0 字节`);
+        return;
+      }
+      // 2) 再弹保存面板（此时只剩复制，快速完成）
       const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
       opts.newFileNames = [`网格-${Date.now()}.${ext}`];
-      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const pickerInst: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
       const uris: string[] = await pickerInst.save(opts);
       if (uris.length === 0) {
         return;
       }
-      interface MeshResult {
-        ok: boolean;
-        triangles?: number;
-        error?: string;
-      }
-      // 先写应用沙箱：内核写 URI 可能失败，沙箱路径可校验大小后再复制
-      const sandbox: string = `${this.getUIContext().getHostContext()!.filesDir}/export.${ext}`;
-      const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, sandbox, 0))) as MeshResult;
-      if (!res.ok) {
-        this.noticeService.error('导出网格失败', res.error ?? '');
-        return;
-      }
-      const st: fs.Stat = fs.statSync(sandbox);
-      if (st.size <= 0) {
-        this.noticeService.error('网格文件为空', `三角面 ${res.triangles ?? 0} 个，文件 0 字节`);
-        return;
-      }
       fs.copyFileSync(sandbox, uris[0]);
       const st2: fs.Stat = fs.statSync(uris[0]);
       this.noticeService.success('网格已导出',
-        `${res.triangles ?? 0} 个三角面 · ${(st2.size / 1024).toFixed(1)} KB（.${ext}）`);
+        `${res.triangles ?? 0} 面 · ${(st2.size / 1024).toFixed(1)} KB · ${res.fallback ? '球面包围体' : '等值面'}`);
     } catch (e) {
       this.noticeService.error('导出网格失败', String(e));
     }
