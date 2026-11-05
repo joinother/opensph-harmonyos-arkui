@@ -384,6 +384,10 @@ struct ArkMain {
   @State private stDt: number = 0;
   @State private stParticles: number = 0;
   @State private stSteps: number = 0;
+  @State private stRunning: boolean = false;
+  @State private stDone: boolean = false;
+  @State private stOk: boolean = false;
+  @State private stError: string = '';
   private statSeries: number[] = [];
   private statCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private pinchStartZoom: number = 1;
@@ -2303,6 +2307,10 @@ interface Probe {
       this.stTime = st.time;
       this.stSteps = st.steps;
       this.stParticles = st.particles;
+      this.stRunning = st.running;
+      this.stDone = st.done;
+      this.stOk = st.ok;
+      this.stError = st.error !== undefined ? st.error : '';
       this.stWall = st.wallclock !== undefined ? st.wallclock : 0;
       this.stProgress = st.progress !== undefined ? st.progress : 0;
       this.stEta = st.eta !== undefined ? st.eta : 0;
@@ -4036,6 +4044,26 @@ interface Probe {
         .width('100%')
         .padding({ left: 10, right: 10, bottom: 4 });
 
+        if (this.stError.length > 0) {
+          Text(`运行结束（失败）：${this.stError}`)
+            .fontSize(10)
+            .fontColor('#d93025')
+            .width('100%')
+            .padding({ left: 10, right: 10, bottom: 2 })
+            .maxLines(2);
+        } else if (this.stDone) {
+          Text(this.stOk ? '运行已正常结束' : '运行已结束')
+            .fontSize(10)
+            .fontColor('#5f6670')
+            .width('100%')
+            .padding({ left: 10, right: 10, bottom: 2 });
+        } else if (this.stRunning) {
+          Text('运行中…')
+            .fontSize(10)
+            .fontColor('#0b57d0')
+            .width('100%')
+            .padding({ left: 10, right: 10, bottom: 2 });
+        }
         Canvas(this.statCtx)
           .width('100%')
           .height(46)

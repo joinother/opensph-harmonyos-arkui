@@ -3103,9 +3103,32 @@ napi_value runSimulation(napi_env env, napi_callback_info info) {
             globals.set(RunSettingsId::RUN_THREAD_GRANULARITY, 1000);
             globals.set(RunSettingsId::RUN_RNG, RngEnum::UNIFORM);
             globals.set(RunSettingsId::RUN_RNG_SEED, 1234);
-            if (endTime > 0) {
-                globals.set(RunSettingsId::RUN_END_TIME, Float(endTime));
+            // 不设 RUN_END_TIME 时内核默认 0 → 模拟会立刻结束（表现为「已正常结束」且 0 步）。
+            // 这里按优先级取值：显式传入 > 节点自身设置 > 默认 3600 s。
+            double endT = endTime;
+            if (endT <= 0) {
+                VirtualSettings ns = clone->getSettings();
+                class EndTimeProc : public VirtualSettings::IEntryProc {
+                public:
+                    mutable double value = 0;
+                    virtual void onCategory(const String&) const override {}
+                    virtual void onEntry(const String& key, IVirtualEntry& entry) const override {
+                        if (key == "run.end_time") {
+                            try {
+                                value = double(entry.get().get<Float>());
+                            } catch (...) {
+                                value = 0;
+                            }
+                        }
+                    }
+                };
+                EndTimeProc proc;
+                ns.enumerate(proc);
+                endT = proc.value > 0 ? proc.value : 3600.0;
             }
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHRun",
+                "run end time = %{public}.1f s", endT);
+            globals.set(RunSettingsId::RUN_END_TIME, Float(endT));
             clone->run(globals, callbacks);
             std::lock_guard<std::mutex> lock(st.mutex);
             st.ok = true;
