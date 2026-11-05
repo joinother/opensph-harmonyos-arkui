@@ -4539,7 +4539,7 @@ interface Probe {
         })
         .margin({ right: 10 });
       if (this.canvasTab === 1) {
-        Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 24) : '无'}`)
+        Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 20) : '无'} pal=${this.palOn ? 1 : 0}/${this.palKind}/${this.palMin.toFixed(1)}-${this.palMax.toFixed(1)}`)
           .fontSize(9)
           .fontColor('#b06000')
           .margin({ left: 8 });

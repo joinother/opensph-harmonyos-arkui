@@ -2536,7 +2536,16 @@ void rasterizeCloud(const std::vector<float>& pts, const float yaw, const float 
         const int sx = int(float(width) * 0.5f + x1 * scale);
         const int sy = int(float(height) * 0.5f - z2 * scale);
         const float depth = std::min(1.f, std::max(0.f, (y2 / radius + 1.f) * 0.5f));
-        const Rgba color(0.35f + 0.45f * depth, 0.55f + 0.35f * depth, 1.f, 1.f);
+        Rgba color(0.35f + 0.45f * depth, 0.55f + 0.35f * depth, 1.f, 1.f);
+        if (g_paletteOn) {
+            // 预览与导出共用同一色标函数：这里按深度映射到所选色标
+            const double span = (g_paletteMax - g_paletteMin) > 1e-9
+                ? (g_paletteMax - g_paletteMin) : 1.0;
+            const double tv = (double(depth) - g_paletteMin) / span;
+            double pr = 0, pg = 0, pb = 0;
+            paletteColor(tv, pr, pg, pb);
+            color = Rgba(float(pr / 255.0), float(pg / 255.0), float(pb / 255.0), 1.f);
+        }
         for (int dy = 0; dy < 2; ++dy) {
             for (int dx = 0; dx < 2; ++dx) {
                 const int px = sx + dx;
