@@ -777,6 +777,11 @@ napi_value setPalette(napi_env env, napi_callback_info info) {
     g_paletteMin = mn;
     g_paletteMax = mx;
     g_paletteOn = on;
+    // 关键：清掉 splat 缓存，否则画面沿用旧着色（此前调色板看起来"没生效"）
+    g_splatCache.clear();
+    for (auto& kv : g_splatDirty) {
+        kv.second = true;
+    }
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHPalette",
         "kind=%{public}d on=%{public}d range=[%{public}.3f,%{public}.3f]",
         kind, on ? 1 : 0, mn, mx);
