@@ -390,6 +390,7 @@ struct ArkMain {
   @State private stError: string = '';
   @State private stSetUp: number = 0;
   @State private stTimeSteps: number = 0;
+  private lastRunHandle: number = -1;
   private statSeries: number[] = [];
   private statCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private pinchStartZoom: number = 1;
@@ -1425,6 +1426,7 @@ interface Probe {
         if (res.ok && res.run !== undefined && res.handles !== undefined
           && res.classes !== undefined && res.links !== undefined) {
           runHandle = res.run;
+          this.lastRunHandle = runHandle;
           // 天体表 → 渲染器（按天体归属选贴图）
           if (res.bodies !== undefined && res.bodies.length > 0) {
             const parts: string[] = [];
@@ -2234,6 +2236,41 @@ interface Probe {
       this.noticeService.success('已保存到所选位置', `${baseName.length > 0 ? baseName : this.exportName}.mp4`);
     } catch (e) {
       this.noticeService.warn('未保存到外部目录', '文件仍在应用目录中');
+    }
+  }
+
+  // 直接运行当前场景：不依赖界面选中，优先用预设建图时记录的运行句柄
+  private runCurrentScene(): void {
+    let handle: number = this.lastRunHandle;
+    if (handle < 0) {
+      for (const n of this.nodes) {
+        if (n.className === 'SPH run' || n.className === 'N-body run'
+          || n.className === 'Position based run') {
+          handle = n.handle;
+          break;
+        }
+      }
+    }
+    if (handle < 0) {
+      this.noticeService.warn('没有可运行的场景', '先用「渲染 → 渲染模拟视频」建场景');
+      return;
+    }
+    try {
+      interface OpResult {
+        ok: boolean;
+        error?: string;
+      }
+      const res: OpResult = JSON.parse(String(ark.runSimulation(handle, 3600))) as OpResult;
+      if (!res.ok) {
+        this.noticeService.error('无法启动模拟', res.error ?? '');
+        return;
+      }
+      this.simRunning = true;
+      this.simPaused = false;
+      this.noticeService.info('模拟已启动', `句柄 ${handle} · 运行 3600 s`);
+      this.pollSim();
+    } catch (e) {
+      this.noticeService.error('无法启动模拟', String(e));
     }
   }
 
@@ -3484,8 +3521,10 @@ interface Probe {
         } else {
           this.startSimRec();
         }
-      } else {
+      } else if (index === 4) {
         this.selfTest();
+      } else {
+        this.runCurrentScene();
       }
     } else if (name === '渲染') {
       if (index === 3) {
@@ -3528,7 +3567,7 @@ interface Probe {
     }
     if (name === '模拟') {
       return ['开始运行', this.simPaused ? '继续' : '暂停', '停止',
-        this.simRecording ? '停止录制' : '录制过程', '自检（IC+模拟）'];
+        this.simRecording ? '停止录制' : '录制过程', '自检（IC+模拟）', '运行当前场景（自动定位运行节点）'];
     }
     if (name === '渲染') {
       return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）'];
