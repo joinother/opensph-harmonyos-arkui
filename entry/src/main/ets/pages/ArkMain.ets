@@ -2961,6 +2961,15 @@ interface Probe {
   }
 
   private clearAll(): void {
+    // 换一个新会话：内核侧的节点表/贴图/任务会整体隔离掉，
+    // 避免只清界面数组而内核仍留着上百个旧节点（此前就是这样导致「无法启动模拟」）
+    try {
+      this.sid = (((Date.now() & 0xFFFFFF) ^ Math.floor(Math.random() * 0xFFFF)) | 0);
+      const r: string = String(ark.setSession(this.sid));
+      hilog.info(0x0000, 'OpenSPHSession', `clearAll -> new sid=${this.sid} ${r}`);
+    } catch (e) {
+      hilog.warn(0x0000, 'OpenSPHSession', `clearAll setSession failed: ${String(e)}`);
+    }
     for (const n of this.nodes) {
       if (n.handle >= 0) {
         try {
