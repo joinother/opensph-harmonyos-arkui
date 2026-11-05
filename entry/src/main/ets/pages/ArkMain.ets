@@ -487,26 +487,55 @@ struct ArkMain {
   }
 
   private loadPreview(): void {
-    // 未选中时自动选运行节点：否则预览只会提示「请选择一个节点」并显示黑屏
-    if (this.selectedNode < 0) {
-      let pick: GraphNode | undefined = undefined;
+    // 预览只支持 IC / 几何类作业。若当前选中的是运行节点（或未选中），
+    // 沿连线往上游找到第一个可预览的节点再预览，否则会一直显示黑屏。
+    const isRun = (c: string): boolean => c === 'SPH run' || c === 'N-body run'
+      || c === 'Position based run';
+    let cur: GraphNode | undefined = this.nodeById(this.selectedNode);
+    if (cur === undefined) {
       for (const n of this.nodes) {
         if (n.handle === this.lastRunHandle) {
-          pick = n;
+          cur = n;
           break;
         }
       }
-      if (pick === undefined) {
-        for (const n of this.nodes) {
-          if (n.className === 'SPH run' || n.className === 'N-body run') {
-            pick = n;
+    }
+    if (cur === undefined) {
+      for (const n of this.nodes) {
+        if (isRun(n.className)) {
+          cur = n;
+          break;
+        }
+      }
+    }
+    // 一路往上游走到「无输入」的源头节点（自带数据的 IC/几何作业），
+    // 中间节点（合并、变换等）单独预览会因缺输入而失败。
+    let guard: number = 0;
+    while (cur !== undefined && guard++ < 12) {
+      let hasInput: boolean = false;
+      for (const l of this.links) {
+        if (l.to === cur.id) {
+          hasInput = true;
+          break;
+        }
+      }
+      if (!hasInput && !isRun(cur.className)) {
+        break;
+      }
+      let up: GraphNode | undefined = undefined;
+      for (const l of this.links) {
+        if (l.to === cur.id) {
+          const cand: GraphNode | undefined = this.nodeById(l.from);
+          if (cand !== undefined && cand.handle >= 0) {
+            up = cand;
             break;
           }
         }
       }
-      if (pick !== undefined) {
-        this.selectedNode = pick.id;
-      }
+      cur = up;
+    }
+    if (cur !== undefined && cur.id !== this.selectedNode) {
+      this.selectedNode = cur.id;
     }
     const node: GraphNode | undefined = this.nodeById(this.selectedNode);
     if (!node || node.handle < 0) {
@@ -4510,6 +4539,10 @@ interface Probe {
         })
         .margin({ right: 10 });
       if (this.canvasTab === 1) {
+        Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 24) : '无'}`)
+          .fontSize(9)
+          .fontColor('#b06000')
+          .margin({ left: 8 });
         if (this.previewLoading) {
           Row({ space: 6 }) {
             LoadingProgress().width(14).height(14).color('#0b57d0');
