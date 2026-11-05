@@ -18,7 +18,7 @@ struct Index {
         .fontWeight(FontWeight.Bold)
         .margin({ top: 60, bottom: 10 })
 
-      Text('SPH/N-body Simulation Suite')
+      Text('SPH / N 体模拟套件')
         .fontSize(16)
         .fontColor('#666666')
         .margin({ bottom: 40 })
@@ -42,10 +42,10 @@ struct Index {
 
       // 信息列表
       Column() {
-        InfoRow({ label: '架构', value: 'ARM64 (aarch64)' })
-        InfoRow({ label: 'GUI 框架', value: 'wxWidgets 3.3.2 (Qt backend)' })
+        InfoRow({ label: '架构', value: 'ARM64（aarch64）' })
+        InfoRow({ label: 'GUI 框架', value: 'wxWidgets 3.3.2（Qt 后端）' })
         InfoRow({ label: 'Qt 版本', value: '6.12.0 (Qt-OH)' })
-        InfoRow({ label: '渲染方式', value: 'Software rasterizer' })
+        InfoRow({ label: '渲染方式', value: '软件光栅化' })
       }
       .width('85%')
       .margin({ bottom: 40 })

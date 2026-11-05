@@ -14,6 +14,7 @@ import fs from '@ohos.file.fs';
 import image from '@ohos.multimedia.image';
 import picker from '@ohos.file.picker';
 import { CursorUtil } from '../common/CursorUtil';
+import { slotLabel } from '../common/SlotLabels';
 import { RemoteServer, RemoteReply, RemoteRequest } from '../common/RemoteServer';
 import { SystemNotifier } from '../common/SystemNotifier';
 
@@ -48,23 +49,36 @@ interface SettingCategory {
   entries: SettingEntry[];
 }
 
+interface LoadedNodeLite {
+  handle: number;
+  className: string;
+  instanceName: string;
+}
+
+interface LoadedLinkLite {
+  from: number;
+  to: number;
+}
+
 interface GraphLink {
   id: number;
   from: number;
   to: number;
 }
 
-@Observed
 class GraphNode {
   id: number;
   handle: number;
+  slots: string[];
   className: string;
   title: string;
   category: string;
   x: number;
   y: number;
 
-  constructor(id: number, handle: number, className: string, title: string, category: string, x: number, y: number) {
+  constructor(id: number, handle: number, className: string, title: string, category: string, x: number, y: number,
+    slots: string[] = []) {
+    this.slots = slots;
     this.id = id;
     this.handle = handle;
     this.className = className;
@@ -353,6 +367,25 @@ struct ArkMain {
   @State private dragSide: number = 0;
   @State private hoverDivider: number = 0;
   @State private hoverCollapse: boolean = false;
+  @State private hoverLib: string = '';
+  private lastSessionUri: string = '';
+  private simTaskId: number = 0;
+  private linkDropY: number = 0;
+  private cardDragging: boolean = false;
+  private pinchStartZoom: number = 1;
+  private twoFingerPanX: number = 0;
+  private twoFingerPanY: number = 0;
+  private dragNodeId: number = -1;
+  private dragNodeBaseX: number = 0;
+  private dragNodeBaseY: number = 0;
+  private panning: boolean = false;
+  private panBaseX: number = 0;
+  private panBaseY: number = 0;
+  private touchBaseX: number = 0;
+  private touchBaseY: number = 0;
+  private canvasLeft: number = 0;
+  private canvasTop: number = 0;
+  @State private hoverEntry: string = '';
   private lastDragX: number = 0;
   @State private menuFocus: string = '';
   private menuCloseTimer: number = -1;
@@ -792,31 +825,28 @@ struct ArkMain {
     }
   }
 
+  // 弹窗预览：用独立 Ability 打开，这样它会作为一个独立窗口出现在任务栏 /
+  // 多任务视图中，可单独最小化、最大化、关闭（子窗口做不到这一点）。
   private async openPreviewWindow(): Promise<void> {
     try {
-      const stage: window.WindowStage | null = WindowHolder.stage;
-      if (stage === null) {
-        this.noticeService.warn('无法弹出预览', 'WindowStage 未就绪');
-        return;
-      }
-      if (WindowHolder.sub !== null) {
-        await WindowHolder.sub.show();
-        this.noticeService.info('预览窗口已存在', '已切到前台');
-        return;
-      }
+      const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const sel: GraphNode | undefined = this.selectedNode >= 0 ? this.nodeById(this.selectedNode) : undefined;
       WindowHolder.previewHandle = sel !== undefined ? sel.handle : -1;
-      const sub: window.Window = await stage.createSubWindow('opensphPreview');
-      WindowHolder.sub = sub;
-      await sub.setUIContent('pages/PreviewWindow');
-      await sub.resize(760, 520);
-      await sub.show();
-      hilog.info(0x0000, 'OpenSPHWin', 'sub window created 760x520');
-      this.noticeService.success('已弹出预览窗口', '760 × 520');
+      interface WantLike {
+        bundleName: string;
+        abilityName: string;
+      }
+      const want: WantLike = {
+        bundleName: 'com.opensph.app',
+        abilityName: 'PreviewAbility'
+      };
+      await ctx.startAbility(want);
+      hilog.info(0x0000, 'OpenSPHWin', 'PreviewAbility started (独立窗口)');
+      this.noticeService.success('已打开预览窗口', '独立窗口，可在任务栏切换');
     } catch (e) {
       const err = e as Error;
-      hilog.error(0x0000, 'OpenSPHWin', `createSubWindow failed: ${err.message ?? String(e)}`);
-      this.noticeService.error('弹出预览失败', err.message ?? String(e));
+      hilog.error(0x0000, 'OpenSPHWin', `startAbility failed: ${err.message ?? String(e)}`);
+      this.noticeService.error('打开预览窗口失败', err.message ?? String(e));
     }
   }
 
@@ -875,6 +905,7 @@ struct ArkMain {
     this.loadMotionPref();
     setTimeout(() => { this.uploadTexture(this.textureKind); }, 1200);
     setTimeout(() => { this.dumpAllSettingNames(); }, 2500);
+    setTimeout(() => { this.dumpAllSlotNames(); }, 4000);
     this.readSystemMotionPref();
     this.calcPaneListHeight();
     this.loadPaneWidths();
@@ -1101,7 +1132,8 @@ struct ArkMain {
       connected: boolean;
       provider?: string;
     }
-    interface Probe {
+
+interface Probe {
       tag: string;
       h: number;
     }
@@ -1291,6 +1323,11 @@ struct ArkMain {
           hilog.info(0x0000, 'OpenSPHCat', `C|${job.className}|${cat.category}`);
           for (const e of cat.entries) {
             hilog.info(0x0000, 'OpenSPHCat', `N|${job.className}|${cat.category}|${e.name}|${e.key}`);
+            if (e.type === 'enum' && e.options !== undefined) {
+              for (const opt of e.options) {
+                hilog.info(0x0000, 'OpenSPHCat', `E|${job.className}|${e.name}|${opt.label}`);
+              }
+            }
             count += 1;
           }
         }
@@ -1299,6 +1336,35 @@ struct ArkMain {
       }
     }
     hilog.info(0x0000, 'OpenSPHCat', `done count=${count} jobs=${jobs.length}`);
+  }
+
+  // 临时诊断：导出所有作业的输入槽位名，用于补全中文翻译
+  private dumpAllSlotNames(): void {
+    interface JobItem {
+      className: string;
+    }
+    let jobs: JobItem[] = [];
+    try {
+      jobs = JSON.parse(String(ark.jobCatalog())) as JobItem[];
+    } catch (e) {
+      return;
+    }
+    for (const job of jobs) {
+      let handle: number = -1;
+      try {
+        handle = Number(ark.createNode(job.className));
+      } catch (e) {
+        continue;
+      }
+      if (handle < 0) {
+        continue;
+      }
+      const slots: string[] = this.readSlots(handle);
+      for (const sl of slots) {
+        hilog.info(0x0000, 'OpenSPHSlots', `SLOT|${job.className}|${sl}`);
+      }
+    }
+    hilog.info(0x0000, 'OpenSPHSlots', 'done');
   }
 
   private startSimExportVideo(): void {
@@ -1394,12 +1460,26 @@ struct ArkMain {
       path: string;
     }
     const opts: SimExportOptions = {
-      width: 3840, height: 2160, fps: 60, frames: 3600,
+      width: 640, height: 360, fps: 24, frames: 8,
       bitrate: 40000000, duration: 2500, path: path
     };
     let res: string = '';
     try {
       res = String(ark.startSimExport(node.handle, JSON.stringify(opts)));
+      try {
+        interface StartRes {
+          ok: boolean;
+          taskId?: number;
+          error?: string;
+        }
+        const sr: StartRes = JSON.parse(res) as StartRes;
+        if (sr.taskId !== undefined) {
+          this.simTaskId = sr.taskId;
+          hilog.info(0x0000, 'OpenSPHSimExp', `own taskId=${this.simTaskId}`);
+        }
+      } catch (e) {
+        // 忽略
+      }
     } catch (e) {
       this.noticeService.error('启动失败', String(e));
       return;
@@ -1426,7 +1506,7 @@ struct ArkMain {
       }
       let st: SimExpStatus | null = null;
       try {
-        st = JSON.parse(String(ark.simExportStatus())) as SimExpStatus;
+        st = JSON.parse(String(ark.simExportStatus(this.simTaskId))) as SimExpStatus;
       } catch (e) {
         clearInterval(timer);
         return;
@@ -1439,7 +1519,7 @@ struct ArkMain {
       this.exportProgress = st.total > 0 ? st.rendered / st.total : 0;
       // 拉取「正在渲染的这一帧」用于预览
       try {
-        const ab: ArrayBuffer = ark.simExportPreview() as ArrayBuffer;
+        const ab: ArrayBuffer = ark.simExportPreview(this.simTaskId) as ArrayBuffer;
         const need: number = 480 * 270 * 4;
         if (ab !== null && ab.byteLength === need) {
           const opts: image.InitializationOptions = {
@@ -1471,7 +1551,7 @@ struct ArkMain {
   private remoteStatusJson(): string {
     let st: string = '{}';
     try {
-      st = String(ark.simExportStatus());
+      st = String(ark.simExportStatus(this.simTaskId));
     } catch (e) {
       st = '{\"error\":\"status unavailable\"}';
     }
@@ -2428,6 +2508,63 @@ struct ArkMain {
     });
   }
 
+  // 输入槽位名 → 中文标签
+  private slotLabel(slot: string): string {
+    const map: Record<string, string> = {
+      'particles': '粒子',
+      'particles A': '粒子 A',
+      'particles B': '粒子 B',
+      'boundary': '边界',
+      'material': '材质',
+      'gravity source': '引力源',
+      'orbiting': '绕行体',
+      'orbited': '被绕行体',
+      'target': '目标',
+      'source': '来源',
+      'modifier': '修饰器',
+      'input': '输入', 'shape': '形状', 'geometry': '几何', 'mesh': '网格'
+    };
+    const hit: string | undefined = map[slot];
+    return hit !== undefined ? hit : slot;
+  }
+
+  // 读取某个内核节点的输入槽位列表
+  private readSlots(handle: number): string[] {
+    interface SlotInfo {
+      name: string;
+      used: boolean;
+      connected: boolean;
+    }
+    const out: string[] = [];
+    try {
+      const slots: SlotInfo[] = JSON.parse(String(ark.nodeSlots(handle))) as SlotInfo[];
+      for (const sl of slots) {
+        out.push(sl.name);
+      }
+    } catch (e) {
+      // 忽略
+    }
+    return out;
+  }
+
+  // 卡片高度随槽位数自适应
+  private cardH(n: GraphNode): number {
+    const rows: number = Math.max(1, n.slots.length);
+    return Math.max(CARD_H, 46 + rows * 20);
+  }
+
+  // 在画布坐标下命中卡片（矩形判定）
+  private hitNode(cx: number, cy: number): GraphNode | null {
+    for (let i = this.nodes.length - 1; i >= 0; i--) {
+      const n: GraphNode = this.nodes[i];
+      if (cx >= n.x - PORT_R && cx <= n.x + CARD_W + PORT_R
+        && cy >= n.y && cy <= n.y + CARD_H) {
+        return n;
+      }
+    }
+    return null;
+  }
+
   private addNode(item: JobEntry): void {
     const offset: number = (this.nodes.length % 6) * 28;
     let handle: number = -1;
@@ -2444,7 +2581,8 @@ struct ArkMain {
       this.nodeTitle(item.className),
       this.label(item.category),
       60 + offset,
-      60 + offset
+      60 + offset,
+      this.readSlots(handle)
     );
     this.getUIContext().animateTo({ duration: durMs(DUR_BASE), curve: Curve.EaseOut }, () => {
       this.nextId += 1;
@@ -2506,6 +2644,7 @@ struct ArkMain {
     }
     this.linkX = n.x + CARD_W + dx;
     this.linkY = n.y + CARD_H / 2 + dy;
+    this.linkDropY = this.linkY;   // 落点纵坐标（画布坐标系）
     // 临时连线必须跟着指针走：Canvas 只在 linkVersion 变化时重绘
     this.linkVersion += 1;
   }
@@ -2546,9 +2685,28 @@ struct ArkMain {
     }
     const fromNode: GraphNode | undefined = this.nodeById(from);
     const toNode: GraphNode | undefined = this.nodeById(target);
+    // 用落点纵坐标选择最近的输入槽位（每个槽位圆点在卡片左侧竖直排列）
+    let dropSlot: string = '';
+    if (toNode !== undefined && toNode.slots !== undefined && toNode.slots.length > 0) {
+      const localY: number = (this.linkDropY - toNode.y) / (this.zoom > 0.01 ? this.zoom : 1);
+      const SLOT_TOP: number = 34;
+      const SLOT_ROW_H: number = 22;
+      let bestIdx: number = 0;
+      let bestDist: number = 1e9;
+      for (let i = 0; i < toNode.slots.length; i++) {
+        const rowY: number = SLOT_TOP + i * SLOT_ROW_H + SLOT_ROW_H / 2;
+        const d: number = Math.abs(localY - rowY);
+        if (d < bestDist) {
+          bestDist = d;
+          bestIdx = i;
+        }
+      }
+      dropSlot = toNode.slots[bestIdx];
+      hilog.info(0x0000, 'OpenSPHLink', `drop slot=${dropSlot} (y=${localY.toFixed(0)}, idx=${bestIdx})`);
+    }
     let slotUsed: string = '';
     if (fromNode && toNode && fromNode.handle >= 0 && toNode.handle >= 0) {
-      slotUsed = this.connectJobs(fromNode.handle, toNode.handle);
+      slotUsed = this.connectJobs(fromNode.handle, toNode.handle, dropSlot);
     }
     // 只有内核真的连上了才画线，避免「提示失败但界面显示已连线」的说谎状态
     if (slotUsed.length === 0) {
@@ -2693,11 +2851,26 @@ struct ArkMain {
     return String(v);
   }
 
-  private connectJobs(fromHandle: number, toHandle: number): string {
+  // 按指定槽位连线；slotName 为空时回退到「第一个未连接的输入槽」
+  private connectJobs(fromHandle: number, toHandle: number, slotName: string = ''): string {
     interface SlotInfo {
       name: string;
       used: boolean;
       connected: boolean;
+    }
+    if (slotName.length > 0) {
+      interface OpResult0 {
+        ok: boolean;
+        error?: string;
+      }
+      try {
+        const r: OpResult0 = JSON.parse(String(ark.connectNodes(fromHandle, toHandle, slotName))) as OpResult0;
+        if (r.ok) {
+          return slotName;
+        }
+      } catch (e) {
+        // 落到回退逻辑
+      }
     }
     try {
       const slots: SlotInfo[] = JSON.parse(String(ark.nodeSlots(toHandle))) as SlotInfo[];
@@ -2773,6 +2946,139 @@ struct ArkMain {
       }
     } catch (e) {
       this.noticeService.error('保存失败', String(e));
+    }
+  }
+
+  // 另存为工程文件：内核先写沙盒临时文件 → 系统保存对话框选位置 → 复制过去
+  private async saveSessionAs(): Promise<void> {
+    interface SaveResult {
+      ok: boolean;
+      nodes: number;
+      connections: number;
+      error?: string;
+    }
+    try {
+      const tmp: string = `${this.sessionPath()}.tmp`;
+      const res: SaveResult = JSON.parse(String(ark.saveSession(tmp))) as SaveResult;
+      if (!res.ok) {
+        this.noticeService.error('保存失败', res.error ?? '');
+        return;
+      }
+      const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+      opts.newFileNames = ['宇宙工坊工程.osph'];
+      opts.fileSuffixChoices = ['.osph'];
+      const docPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(
+        this.getUIContext().getHostContext() as common.UIAbilityContext);
+      const uris: string[] = await docPicker.save(opts);
+      if (uris.length === 0) {
+        this.noticeService.warn('未保存', '已取消选择位置');
+        return;
+      }
+      const src: fs.File = fs.openSync(tmp, fs.OpenMode.READ_ONLY);
+      const dst: fs.File = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.copyFileSync(src.fd, dst.fd);
+      fs.closeSync(src);
+      fs.closeSync(dst);
+      this.lastSessionUri = uris[0];
+      hilog.info(0x0000, 'OpenSPHSave', `session saved to ${uris[0]}`);
+      this.noticeService.success('工程已保存', `${res.nodes} 个节点 · ${res.connections} 条连接`);
+    } catch (e) {
+      const err = e as Error;
+      hilog.error(0x0000, 'OpenSPHSave', `saveSessionAs failed: ${err.message ?? String(e)}`);
+      this.noticeService.error('保存失败', err.message ?? String(e));
+    }
+  }
+
+  // 从用户选的工程文件打开
+  private async openSessionFrom(): Promise<void> {
+    interface LoadResult {
+      ok: boolean;
+      nodes: number;
+      connections: number;
+      nodeList: LoadedNodeLite[];
+      linkList: LoadedLinkLite[];
+      error?: string;
+    }
+    try {
+      const opts: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      opts.maxSelectNumber = 1;
+      opts.fileSuffixFilters = ['.osph'];
+      const docPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(
+        this.getUIContext().getHostContext() as common.UIAbilityContext);
+      const uris: string[] = await docPicker.select(opts);
+      if (uris.length === 0) {
+        this.noticeService.warn('未打开', '已取消选择文件');
+        return;
+      }
+      const tmp: string = `${this.sessionPath()}.open`;
+      const src: fs.File = fs.openSync(uris[0], fs.OpenMode.READ_ONLY);
+      const dst: fs.File = fs.openSync(tmp, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.copyFileSync(src.fd, dst.fd);
+      fs.closeSync(src);
+      fs.closeSync(dst);
+      const res: LoadResult = JSON.parse(String(ark.loadSession(tmp))) as LoadResult;
+      if (!res.ok) {
+        this.noticeService.warn('打开失败', res.error ?? '文件格式不正确');
+        return;
+      }
+      this.rebuildFromSession(res.nodeList, res.linkList);
+      this.lastSessionUri = uris[0];
+      this.noticeService.success('工程已打开', `${res.nodes} 个节点 · ${res.connections} 条连接`);
+    } catch (e) {
+      const err = e as Error;
+      hilog.error(0x0000, 'OpenSPHOpen', `openSessionFrom failed: ${err.message ?? String(e)}`);
+      this.noticeService.error('打开失败', err.message ?? String(e));
+    }
+  }
+
+  private rebuildFromSession(nodeList: LoadedNodeLite[], linkList: LoadedLinkLite[]): void {
+    this.nodes = [];
+    this.links = [];
+    this.selectedNode = -1;
+    const handleToId: Map<number, number> = new Map<number, number>();
+    let idCounter: number = 1;
+    for (const n of nodeList) {
+      const node: GraphNode = new GraphNode(idCounter, n.handle, n.className,
+        this.nodeTitle(n.className), this.label(this.categoryOf(n.className)),
+        ((idCounter - 1) % 4) * 230 + 40, Math.floor((idCounter - 1) / 4) * 120 + 40,
+        this.readSlots(n.handle));
+      handleToId.set(n.handle, idCounter);
+      this.nodes = this.nodes.concat([node]);
+      idCounter += 1;
+    }
+    let linkId: number = 1;
+    for (const l of linkList) {
+      const fromId: number | undefined = handleToId.get(l.from);
+      const toId: number | undefined = handleToId.get(l.to);
+      if (fromId === undefined || toId === undefined) {
+        continue;
+      }
+      const link: GraphLink = { id: linkId, from: fromId, to: toId };
+      this.links = this.links.concat([link]);
+      linkId += 1;
+    }
+    this.nextId = idCounter;
+    this.linkVersion += 1;
+    this.syncCanvasFromKernel();
+    hilog.info(0x0000, 'OpenSPHOpen', `rebuilt nodes=${this.nodes.length} links=${this.links.length}`);
+  }
+
+  // 新建窗口：multiton 模式下每次 startAbility 都会创建独立实例与窗口
+  private async startNewWindow(): Promise<void> {
+    try {
+      const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      interface WantLike {
+        bundleName: string;
+        abilityName: string;
+      }
+      const want: WantLike = {
+        bundleName: 'com.opensph.app',
+        abilityName: 'ArkAbility'
+      };
+      await ctx.startAbility(want);
+      this.noticeService.success('已新建窗口', '独立会话窗口');
+    } catch (e) {
+      this.noticeService.error('新建窗口失败', String(e));
     }
   }
 
@@ -2980,12 +3286,16 @@ struct ArkMain {
     this.openMenu = '';
     if (name === '文件') {
       if (index === 0) {
+        // 新建窗口：启动一个新的 Ability 实例（multiton），各自独立窗口
+        this.startNewWindow();
         this.clearAll();
         this.noticeService.info('新建会话', '已清空画布');
       } else if (index === 1) {
-        this.loadSession();
+        this.openSessionFrom();
       } else if (index === 2) {
         this.saveSession();
+      } else if (index === 3) {
+        this.saveSessionAs();
       } else {
         const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
         ctx.terminateSelf();
@@ -3128,7 +3438,7 @@ struct ArkMain {
 
   private menuLabels(name: string): string[] {
     if (name === '文件') {
-      return ['新建会话', '打开会话', '保存会话', '退出'];
+      return ['新建窗口', '打开工程…', '保存工程', '另存为…', '退出'];
     }
     if (name === '编辑') {
       return ['删除选中节点', '克隆选中节点', '删除选中节点及其下游', '清空画布'];
@@ -3550,20 +3860,29 @@ struct ArkMain {
             ListItemGroup({ header: this.groupHeader(group) }) {
               ForEach(group.items, (item: JobEntry) => {
                 ListItem() {
-                  Text(this.nodeTitle(item.className))
-                    .fontSize(13)
-                    .fontColor('#1f2328')
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .width('100%')
-                    .padding({ left: 26, right: 12, top: 7, bottom: 7 })
-                    .borderRadius(6)
-                    .stateStyles({
-                      normal: { .backgroundColor(Color.Transparent) },
-                      hovered: { .backgroundColor('#eceff3') },
-                      pressed: { .backgroundColor('#e6effd') }
-                    })
-                    .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
+                  Row() {
+                    Column()
+                      .width(3)
+                      .height(18)
+                      .borderRadius(2)
+                      .backgroundColor(this.hoverLib === item.className ? '#0b57d0' : Color.Transparent)
+                      .margin({ left: 14, right: 9 });
+                    Text(this.nodeTitle(item.className))
+                      .fontSize(13)
+                      .fontColor(this.hoverLib === item.className ? '#0b57d0' : '#1f2328')
+                      .fontWeight(this.hoverLib === item.className ? FontWeight.Medium : FontWeight.Normal)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .layoutWeight(1)
+                      .padding({ right: 12, top: 7, bottom: 7 });
+                  }
+                  .width('100%')
+                  .borderRadius(6)
+                  .backgroundColor(this.hoverLib === item.className ? '#e8f0fe' : Color.Transparent)
+                  .onHover((h: boolean) => {
+                    this.hoverLib = h ? item.className : (this.hoverLib === item.className ? '' : this.hoverLib);
+                    if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); }
+                  })
                 }
                 .onClick(() => {
                   this.addNode(item);
@@ -3601,6 +3920,7 @@ struct ArkMain {
       .width('100%')
       .height('100%')
       .position({ x: 0, y: 0 })
+      .hitTestBehavior(HitTestMode.None)
       .onReady(() => {
         this.drawLinks();
       })
@@ -3904,6 +4224,7 @@ struct ArkMain {
         NodeCard({
           node: n,
           selected: this.selectedNode,
+          zoom: this.zoom,
           onSelect: (id: number) => {
             this.getUIContext().animateTo({ duration: durMs(DUR_BASE), curve: Curve.Friction }, () => {
               this.selectedNode = id;
@@ -3925,6 +4246,9 @@ struct ArkMain {
           onLinkEnd: (id: number) => {
             this.finishLink(id);
           },
+          onDragState: (active: boolean) => {
+            this.cardDragging = active;
+          },
           onContextMenu: (id: number, wx: number, wy: number) => {
             const n: GraphNode | undefined = this.nodeById(id);
             if (n === undefined) {
@@ -3941,9 +4265,11 @@ struct ArkMain {
               this.ctxWX = wx;
               this.ctxWY = wy;
             } else {
-              // ⋯ 按钮：按卡片位置换算到窗口坐标（画布偏移 + 缩放/平移）
-              this.ctxWX = 220 + (n.x + CARD_W - 40) * this.zoom + this.panX;
-              this.ctxWY = 140 + (n.y + 28) * this.zoom + this.panY;
+              // ⋯ 按钮：用画布当前真实屏幕原点 + 卡片在画布内的位置换算，
+              // 不再用硬编码偏移（原来会用 220/140，导致菜单离卡片很远）
+              const z: number = this.zoom > 0.01 ? this.zoom : 1;
+              this.ctxWX = this.canvasLeft + (n.x + CARD_W - 44) * z;
+              this.ctxWY = this.canvasTop + (n.y + CARD_H / 2) * z;
             }
           }
         })
@@ -3953,24 +4279,12 @@ struct ArkMain {
         .height('100%')
         .translate({ x: this.panX, y: this.panY })
         .scale({ x: this.zoom, y: this.zoom })
+        .onAreaChange((oldArea: Area, newArea: Area) => {
+          this.canvasLeft = newArea.globalPosition.x as number;
+          this.canvasTop = newArea.globalPosition.y as number;
+        })
         .animation({ duration: 0 })
-        .gesture(
-          PanGesture({ fingers: 1, distance: 12 })
-            .onActionStart(() => {
-              CursorUtil.grabbing();
-            })
-            .onActionUpdate((event: GestureEvent) => {
-              this.panX += event.offsetX - this.lastPanX;
-              this.panY += event.offsetY - this.lastPanY;
-              this.lastPanX = event.offsetX;
-              this.lastPanY = event.offsetY;
-            })
-            .onActionEnd(() => {
-              this.lastPanX = 0;
-              this.lastPanY = 0;
-              CursorUtil.grab();
-            })
-        )
+        .hitTestBehavior(HitTestMode.Transparent)
       }
     }
     .layoutWeight(1)
@@ -3983,6 +4297,105 @@ struct ArkMain {
         CursorUtil.grab();
       } else {
         CursorUtil.reset();
+      }
+    })
+    // 触控板/触摸双指：捏合缩放 + 双指拖动平移（类似地图/照片）
+    .gesture(
+      GestureGroup(GestureMode.Parallel,
+        PinchGesture({ fingers: 2, distance: 1 })
+          .onActionStart(() => {
+            this.pinchStartZoom = this.zoom;
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            if (event.scale === undefined) {
+              return;
+            }
+            const next: number = this.pinchStartZoom * event.scale;
+            this.zoom = Math.min(2.5, Math.max(0.4, Math.round(next * 100) / 100));
+          })
+          .onActionEnd(() => {
+            hilog.info(0x0000, 'OpenSPHZoom', `pinch end zoom=${this.zoom.toFixed(2)}`);
+          }),
+        PanGesture({ fingers: 2, direction: PanDirection.All, distance: 1 })
+          .onActionStart(() => {
+            this.twoFingerPanX = this.panX;
+            this.twoFingerPanY = this.panY;
+            CursorUtil.grabbing();
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            this.panX = this.twoFingerPanX + event.offsetX;
+            this.panY = this.twoFingerPanY + event.offsetY;
+          })
+          .onActionEnd(() => {
+            CursorUtil.grab();
+            hilog.info(0x0000, 'OpenSPHPan', `two-finger end panX=${this.panX.toFixed(0)} panY=${this.panY.toFixed(0)}`);
+          })
+      )
+    )
+    // 画布内统一处理：命中节点 → 选中/拖动；否则平移画布
+    .onTouch((event: TouchEvent) => {
+      const t: TouchObject = event.touches[0];
+      if (t === undefined) {
+        return;
+      }
+      if (event.type === TouchType.Down) {
+        const z: number = this.zoom > 0.01 ? this.zoom : 1;
+        const cx: number = (t.windowX - this.canvasLeft) / z;
+        const cy: number = (t.windowY - this.canvasTop) / z;
+        const hit: GraphNode | null = this.hitNode(cx, cy);
+        this.touchBaseX = t.windowX;
+        this.touchBaseY = t.windowY;
+        this.panning = false;
+        if (hit !== null) {
+          this.dragNodeId = -1;   // 卡片拖动交给卡片自身手势，画布不平移
+          if (this.selectedNode !== hit.id) {
+            this.selectedNode = hit.id;
+            this.loadSettingsForce(hit.id);
+            this.dragNodeId = -1;             // 首次按下仅选中
+          } else {
+            this.dragNodeId = hit.id;         // 已选中才进入拖动
+            this.dragNodeBaseX = hit.x;
+            this.dragNodeBaseY = hit.y;
+            CursorUtil.grabbing();
+          }
+        } else {
+          this.dragNodeId = -1;
+          this.panning = true;
+          this.panBaseX = this.panX;
+          this.panBaseY = this.panY;
+          this.panBaseX = this.panX;
+          this.panBaseY = this.panY;
+          CursorUtil.grabbing();
+        }
+        return;
+      }
+      if (event.type === TouchType.Move) {
+        const dz: number = this.zoom > 0.01 ? this.zoom : 1;
+        const dx: number = (t.windowX - this.touchBaseX) / dz;
+        const dy: number = (t.windowY - this.touchBaseY) / dz;
+        if (this.dragNodeId >= 0) {
+          const n: GraphNode | undefined = this.nodeById(this.dragNodeId);
+          if (n !== undefined) {
+            n.x = this.dragNodeBaseX + dx;
+            n.y = this.dragNodeBaseY + dy;
+            hilog.info(0x0000, 'OpenSPHDrag',
+              `move id=${this.dragNodeId} dx=${dx.toFixed(0)} dy=${dy.toFixed(0)} -> ${n.x.toFixed(0)},${n.y.toFixed(0)}`);
+            this.linkVersion += 1;
+          }
+        } else if (this.panning) {
+          this.panX = this.panBaseX + dx;
+          this.panY = this.panBaseY + dy;
+        }
+        return;
+      }
+      if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+        if (this.dragNodeId >= 0 || this.panning) {
+          hilog.info(0x0000, 'OpenSPHDrag',
+            `end node=${this.dragNodeId} pan=${this.panning} panX=${this.panX.toFixed(0)} panY=${this.panY.toFixed(0)}`);
+        }
+        this.dragNodeId = -1;
+        this.panning = false;
+        CursorUtil.grab();
       }
     })
     .onClick(() => {
@@ -4105,7 +4518,10 @@ struct ArkMain {
           Row({ space: 4 }) {
             ForEach([0, 1, 2], (i: number) => {
               TextInput({ text: this.numAt(entry, i) })
-                .onHover((h: boolean) => { if (h) { CursorUtil.text(); } else { CursorUtil.reset(); } })
+                .onHover((h: boolean) => {
+                  if (!h) { CursorUtil.reset(); } else if (entry.enabled) { CursorUtil.text(); } else { CursorUtil.forbid(); }
+                })
+                .enabled(entry.enabled)
                 .type(InputType.NUMBER_DECIMAL)
                 .fontSize(11)
                 .width(58)
@@ -4146,7 +4562,10 @@ struct ArkMain {
           Row({ space: 4 }) {
             ForEach([0, 1], (i: number) => {
               TextInput({ text: this.numAt(entry, i) })
-                .onHover((h: boolean) => { if (h) { CursorUtil.text(); } else { CursorUtil.reset(); } })
+                .onHover((h: boolean) => {
+                  if (!h) { CursorUtil.reset(); } else if (entry.enabled) { CursorUtil.text(); } else { CursorUtil.forbid(); }
+                })
+                .enabled(entry.enabled)
                 .type(InputType.NUMBER_DECIMAL)
                 .fontSize(11)
                 .width(64)
@@ -4185,7 +4604,10 @@ struct ArkMain {
           }
         } else if (entry.type === 'bool') {
           Toggle({ type: ToggleType.Switch, isOn: entry.value === true })
-            .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
+            .enabled(entry.enabled)
+            .onHover((h: boolean) => {
+              if (!h) { CursorUtil.reset(); } else if (entry.enabled) { CursorUtil.hand(); } else { CursorUtil.forbid(); }
+            })
             .selectedColor('#0b57d0')
             .onChange((isOn: boolean) => {
               this.applySetting(entry, isOn ? 'true' : 'false');
@@ -4195,6 +4617,7 @@ struct ArkMain {
             const item: SelectOption = { value: this.enumOptionLabel(o) };
             return item;
           }))
+            .enabled(entry.enabled)
             .selected(this.enumIndex(entry))
             .value(this.enumLabel(entry))
             .font({ size: 12 })
@@ -4205,7 +4628,10 @@ struct ArkMain {
             })
         } else if (entry.type === 'int' || entry.type === 'float') {
           TextInput({ text: this.valueText(entry) })
-            .onHover((h: boolean) => { if (h) { CursorUtil.text(); } else { CursorUtil.reset(); } })
+            .onHover((h: boolean) => {
+              if (!h) { CursorUtil.reset(); } else if (entry.enabled) { CursorUtil.text(); } else { CursorUtil.forbid(); }
+            })
+            .enabled(entry.enabled)
             .type(entry.type === 'float' ? InputType.NUMBER_DECIMAL : InputType.Number)
             .fontSize(12)
             .width(96)
@@ -4236,7 +4662,12 @@ struct ArkMain {
         }
       }
       .width('100%')
-      .padding({ top: 6, bottom: 6 })
+      .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+      .borderRadius(6)
+      .backgroundColor(this.hoverEntry === entry.key ? '#eef3fd' : Color.Transparent)
+      .onHover((h: boolean) => {
+        this.hoverEntry = h ? entry.key : (this.hoverEntry === entry.key ? '' : this.hoverEntry);
+      })
       Divider().color('#f0f2f5')
     }
     .width('100%')
@@ -4746,7 +5177,7 @@ struct ArkMain {
           .margin({ top: 4, bottom: 4 })
           .onClick(() => {
             try {
-              ark.stopSimExport();
+              ark.stopSimExport(this.simTaskId);
               this.noticeService.info('正在停止', '已渲染的帧会保留为可播放视频');
             } catch (e) {
               this.noticeService.error('取消失败', String(e));
@@ -5017,6 +5448,25 @@ struct NodeCard {
   onLinkMove: (id: number, dx: number, dy: number) => void = () => {};
   onLinkEnd: (id: number) => void = () => {};
   onContextMenu: (id: number, x: number, y: number) => void = () => {};
+  onDragState: (active: boolean) => void = () => {};
+  @State private hoverBtn: string = '';
+  // 槽位列表：至少一个占位，保证形状稳定
+  // 卡片高度 = 标题区 + 副标题 + 槽位行 + 上下内边距（内容驱动，避免圆点压到底边）
+  private cardHeight(): number {
+    const rows: number = this.slotRows().length;
+    const SLOT_ROW_H: number = 24;
+    return 22 + 18 + rows * SLOT_ROW_H + 10;
+  }
+  private slotRows(): string[] {
+    return this.node.slots !== undefined && this.node.slots.length > 0 ? this.node.slots : [''];
+  }
+  private slotLabelOf(slot: string): string {
+    return slotLabel(slot);
+  }
+  @State private dragging: boolean = false;
+  @Prop zoom: number = 1;
+  private baseWinX: number = 0;
+  private baseWinY: number = 0;
   private dragStartX: number = 0;
   private dragStartY: number = 0;
 
@@ -5037,34 +5487,32 @@ struct NodeCard {
             .layoutWeight(1);
           Text('⋯')
             .fontSize(14)
-            .fontColor('#5f6670')
+            .fontColor(this.hoverBtn === 'menu' ? '#0b57d0' : '#5f6670')
             .width(20)
             .height(20)
             .textAlign(TextAlign.Center)
             .borderRadius(4)
-            .stateStyles({
-              normal: { .backgroundColor(Color.Transparent) },
-              hovered: { .backgroundColor('#eceff3') },
-              pressed: { .backgroundColor('#e6effd') }
+            .backgroundColor(this.hoverBtn === 'menu' ? '#e8f0fe' : Color.Transparent)
+            .onHover((h: boolean) => {
+              this.hoverBtn = h ? 'menu' : (this.hoverBtn === 'menu' ? '' : this.hoverBtn);
+              if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); }
             })
-            .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
             .onClick(() => {
               this.onContextMenu(this.node.id, 0, 0);
             })
             .margin({ right: 2 });
           Text('×')
             .fontSize(14)
-            .fontColor('#8b929b')
+            .fontColor(this.hoverBtn === 'del' ? '#c0392b' : '#8b929b')
             .width(20)
             .height(20)
             .textAlign(TextAlign.Center)
             .borderRadius(4)
-            .stateStyles({
-              normal: { .backgroundColor(Color.Transparent) },
-              hovered: { .backgroundColor('#f0d6d6') },
-              pressed: { .backgroundColor('#f3c9c9') }
+            .backgroundColor(this.hoverBtn === 'del' ? '#fde8e8' : Color.Transparent)
+            .onHover((h: boolean) => {
+              this.hoverBtn = h ? 'del' : (this.hoverBtn === 'del' ? '' : this.hoverBtn);
+              if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); }
             })
-            .onHover((h: boolean) => { if (h) { CursorUtil.hand(); } else { CursorUtil.reset(); } })
             .onClick(() => {
               this.onRemove(this.node.id);
             })
@@ -5076,13 +5524,81 @@ struct NodeCard {
           .margin({ top: 2 })
       }
       .width(CARD_W)
-      .height(CARD_H)
+      .height(this.cardHeight())
       .padding({ left: 16, right: 10, top: 8, bottom: 8 })
       .alignItems(HorizontalAlign.Start)
       .backgroundColor('#ffffff')
       .borderRadius(10)
       .border({ width: this.isSelected() ? 2 : 1, color: this.isSelected() ? '#0b57d0' : '#dfe3e8' })
       .shadow({ radius: this.isSelected() ? 14 : 6, color: '#1a000000', offsetY: 2 })
+      .onTouch((event: TouchEvent) => {
+        const t: TouchObject = event.touches[0];
+        if (t === undefined) {
+          return;
+        }
+        if (event.type === TouchType.Down) {
+          this.baseWinX = t.windowX;
+          this.baseWinY = t.windowY;
+          this.dragStartX = this.node.x;
+          this.dragStartY = this.node.y;
+          this.onSelect(this.node.id);
+          this.dragging = true;          // 按下即可拖，不需要先点一次
+          this.onDragState(true);        // 通知父级：画布不要平移
+          CursorUtil.grabbing();
+          hilog.info(0x0000, 'OpenSPHTouchDrag', `down id=${this.node.id} drag=${this.dragging}`);
+          return;
+        }
+        if (event.type === TouchType.Move && this.dragging) {
+          const z: number = this.zoom > 0.01 ? this.zoom : 1;
+          this.node.x = this.dragStartX + (t.windowX - this.baseWinX) / z;
+          this.node.y = this.dragStartY + (t.windowY - this.baseWinY) / z;
+          this.onMove();
+          return;
+        }
+        if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+          if (this.dragging) {
+            this.dragging = false;
+            this.onDragState(false);
+            this.onMove();
+            hilog.info(0x0000, 'OpenSPHTouchDrag',
+              `up id=${this.node.id} -> ${this.node.x.toFixed(0)},${this.node.y.toFixed(0)}`);
+          }
+        }
+      })
+      .onMouse((event: MouseEvent) => {
+        if (event.button === MouseButton.Right && event.action === MouseAction.Press) {
+          this.onContextMenu(this.node.id, event.windowX, event.windowY);
+          event.stopPropagation();
+          return;
+        }
+        if (event.action === MouseAction.Press) {
+          this.baseWinX = event.windowX;
+          this.baseWinY = event.windowY;
+          this.dragStartX = this.node.x;
+          this.dragStartY = this.node.y;
+          this.onSelect(this.node.id);
+          this.dragging = true;
+          this.onDragState(true);
+          CursorUtil.grabbing();
+          hilog.info(0x0000, 'OpenSPHMouseDrag', `press id=${this.node.id} drag=${this.dragging}`);
+          return;
+        }
+        if (event.action === MouseAction.Move && this.dragging) {
+          const z: number = this.zoom > 0.01 ? this.zoom : 1;
+          this.node.x = this.dragStartX + (event.windowX - this.baseWinX) / z;
+          this.node.y = this.dragStartY + (event.windowY - this.baseWinY) / z;
+          this.onMove();
+          hilog.info(0x0000, 'OpenSPHMouseDrag',
+            `move id=${this.node.id} -> ${this.node.x.toFixed(0)},${this.node.y.toFixed(0)}`);
+          return;
+        }
+        if (event.action === MouseAction.Release && this.dragging) {
+          this.dragging = false;
+          this.onDragState(false);
+          this.onMove();
+          hilog.info(0x0000, 'OpenSPHMouseDrag', `release id=${this.node.id}`);
+        }
+      })
       .gesture(
         GestureGroup(
           GestureMode.Parallel,
@@ -5090,34 +5606,38 @@ struct NodeCard {
             .onAction(() => {
               this.onSelect(this.node.id);
             }),
-          PanGesture({ fingers: 1, direction: PanDirection.All, distance: 0 })
-            .onActionStart(() => {
-              this.onSelect(this.node.id);
-              this.dragStartX = this.node.x;
-              this.dragStartY = this.node.y;
-            })
-            .onActionUpdate((event: GestureEvent) => {
-              this.node.x = this.dragStartX + event.offsetX;
-              this.node.y = this.dragStartY + event.offsetY;
-              this.onMove();
-            })
         )
       )
 
-      // 输入端口（左）
-      Circle({ width: PORT_R * 2, height: PORT_R * 2 })
-        .fill('#ffffff')
-        .stroke('#8ab4f8')
-        .strokeWidth(2)
-        .offset({ x: -PORT_R })
-        .onHover((h: boolean) => {
-          if (h) { CursorUtil.dropTarget(); } else { CursorUtil.reset(); }
-        })
+      // 输入端口（左）：每个槽位一个圆点，圆心压在卡片左边框上，右侧跟标签
+      Column({ space: 0 }) {
+        ForEach(this.slotRows(), (slot: string, index: number) => {
+          Row({ space: 6 }) {
+            Circle({ width: PORT_R * 2, height: PORT_R * 2 })
+              .fill('#ffffff')
+              .stroke('#8ab4f8')
+              .strokeWidth(2)
+              .onHover((h: boolean) => {
+                if (h) { CursorUtil.dropTarget(); } else { CursorUtil.reset(); }
+              })
+              .offset({ x: -PORT_R - 9 });
+            Text(this.slotLabelOf(slot))
+              .fontSize(9)
+              .fontColor('#68727d')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis });
+          }
+          .height(24)
+          .alignItems(VerticalAlign.Center);
+        }, (slot: string) => slot)
+      }
+      .position({ x: -PORT_R, y: 40 })
+      .alignItems(HorizontalAlign.Start)
 
-      // 输出端口（右）+ 拖拽连线
+      // 输出端口（右）+ 拖拽连线：圆心压在右边框上、垂直居中
       Circle({ width: PORT_R * 2, height: PORT_R * 2 })
         .fill('#8ab4f8')
-        .offset({ x: CARD_W - PORT_R })
+        .offset({ x: CARD_W - PORT_R, y: this.cardHeight() / 2 - PORT_R })
         .onHover((h: boolean) => {
           if (h) { CursorUtil.link(); } else { CursorUtil.reset(); }
         })
@@ -5139,19 +5659,13 @@ struct NodeCard {
     .margin({ left: -PORT_R })
     .position({ x: this.node.x, y: this.node.y })
     .onHover((isHover: boolean) => {
-      if (isHover) {
+      // 未选中：默认指针；已选中：移动指针（此时才允许实质拖动）
+      if (!isHover) {
+        CursorUtil.reset();
+      } else if (this.selected === this.node.id) {
         CursorUtil.move();
       } else {
         CursorUtil.reset();
-      }
-    })
-    .onMouse((event: MouseEvent) => {
-      if (event.action === MouseAction.Press) {
-        hilog.info(0x0000, 'OpenSPHMouse', `card mouse button=${event.button} xy=${event.x},${event.y}`);
-      }
-      if (event.button === MouseButton.Right && event.action === MouseAction.Press) {
-        this.onContextMenu(this.node.id, event.windowX, event.windowY);
-        event.stopPropagation();
       }
     })
     .transition(TransitionEffect.OPACITY.animation({ duration: durMs(DUR_BASE), curve: Curve.EaseOut }))

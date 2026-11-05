@@ -19,9 +19,20 @@
     ],
     "abilities": [
       {
+        "name": "PreviewAbility",
+        "srcEntry": "./ets/previewability/PreviewAbility.ets",
+        "launchType": "singleton",
+        "description": "$string:EntryAbility_desc",
+        "icon": "$media:app_icon",
+        "label": "$string:EntryAbility_label",
+        "startWindowIcon": "$media:app_icon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": false
+      },
+      {
         "name": "ArkAbility",
         "srcEntry": "./ets/arkability/ArkAbility.ets",
-        "launchType": "singleton",
+        "launchType": "multiton",
         "description": "$string:EntryAbility_desc",
         "icon": "$media:app_icon",
         "label": "$string:EntryAbility_label",

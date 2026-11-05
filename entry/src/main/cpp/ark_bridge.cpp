@@ -65,7 +65,16 @@ struct BodyTex {
 };
 static std::vector<BodyTex> g_bodies;
 
+std::mutex g_texMutex;
+
+// 渲染线程的贴图快照（thread_local）：导出任务启动时绑定自己的快照，
+// 这样多个任务并发渲染时互不影响；UI 线程为空则用全局贴图。
+static thread_local const std::vector<uint8_t>* tlsTexSnap[kMaxTex] = { nullptr };
+static thread_local int tlsTexW[kMaxTex] = { 0 };
+static thread_local int tlsTexH[kMaxTex] = { 0 };
+
 static void setTextureData(const int slot, const int w, const int h, const uint8_t* src) {
+    std::lock_guard<std::mutex> gl(g_texMutex);
     const int i = (slot >= 0 && slot < kMaxTex) ? slot : 0;
     if (w <= 0 || h <= 0 || src == nullptr) {
         g_tex[i].clear();
@@ -81,6 +90,29 @@ static void setTextureData(const int slot, const int w, const int h, const uint8
 static bool sampleTexture(const int slot, const double u, const double v,
     double& outR, double& outG, double& outB) {
     const int si = (slot >= 0 && slot < kMaxTex) ? slot : 0;
+    if (tlsTexW[si] > 0 && tlsTexSnap[si] != nullptr && !tlsTexSnap[si]->empty()) {
+        const int texW = tlsTexW[si];
+        const int texH = tlsTexH[si];
+        const std::vector<uint8_t>& texBuf = *tlsTexSnap[si];
+        const double uu = u - std::floor(u);
+        const double vv = v - std::floor(v);
+        const double x = uu * double(texW - 1);
+        const double y = vv * double(texH - 1);
+        const int xa = int(x), ya = int(y);
+        const int x1 = (xa + 1) % texW, y1 = (ya + 1) % texH;
+        const double fx = x - xa, fy = y - ya;
+        auto at = [&](const int px, const int py, const int ch) {
+            const size_t o = (size_t(py) * size_t(texW) + size_t(px)) * 4;
+            return double(texBuf[o + ch]) / 255.0;
+        };
+        const double r00 = at(xa, ya, 2), r10 = at(x1, ya, 2), r01 = at(xa, y1, 2), r11 = at(x1, y1, 2);
+        const double g00 = at(xa, ya, 1), g10 = at(x1, ya, 1), g01 = at(xa, y1, 1), g11 = at(x1, y1, 1);
+        const double b00 = at(xa, ya, 0), b10 = at(x1, ya, 0), b01 = at(xa, y1, 0), b11 = at(x1, y1, 0);
+        outR = (r00 * (1 - fx) + r10 * fx) * (1 - fy) + (r01 * (1 - fx) + r11 * fx) * fy;
+        outG = (g00 * (1 - fx) + g10 * fx) * (1 - fy) + (g01 * (1 - fx) + g11 * fx) * fy;
+        outB = (b00 * (1 - fx) + b10 * fx) * (1 - fy) + (b01 * (1 - fx) + b11 * fx) * fy;
+        return true;
+    }
     if (g_texW[si] <= 0 || g_texH[si] <= 0 || g_tex[si].empty()) {
         return false;
     }
@@ -370,17 +402,13 @@ static void splatPoints(const std::vector<float>& pts,
             mg = tg * 255.0;
             mb = tb * 255.0;
         } else {
-        const double t = std::min(1.0, double(sm.rr));
-        if (t < 0.35) {
-            const double u = t / 0.35;
-            mr = 40 + 130 * u; mg = 10 + 30 * u; mb = 105 + 20 * u;
-        } else if (t < 0.7) {
-            const double u = (t - 0.35) / 0.35;
-            mr = 170 + 75 * u; mg = 40 + 90 * u; mb = 125 - 55 * u;
-        } else {
-            const double u = (t - 0.7) / 0.3;
-            mr = 245 + 10 * u; mg = 130 + 110 * u; mb = 70 + 120 * u;
-        }
+        // 统一回退色：没有贴图时用中性灰白（按半径做很轻微的内深外浅），
+        // 不再使用橙/品红色标，避免被误认为贴图颜色出错。
+        const double t = std::min(1.0, std::max(0.0, double(sm.rr)));
+        const double g = 150.0 + 55.0 * t;   // 150 → 205 的中性灰
+        mr = g;
+        mg = g;
+        mb = g * 1.01;                        // 极轻微偏冷，避免纯灰发闷
         }
         const double texGain = hasTex ? 1.55 : 1.0;
         const double cr = std::min(255.0, mr * lum * texGain + 240 * spec);
@@ -1531,6 +1559,12 @@ napi_value setTexture(napi_env env, napi_callback_info info) {
         napi_get_value_int32(env, argv[1], &h);
         ab = argv[2];
     }
+    // w/h 为 0 表示「清空该槽位」，此时允许空数组
+    if (w <= 0 || h <= 0) {
+        setTextureData(slot, 0, 0, nullptr);
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHTex", "cleared slot %{public}d", slot);
+        return makeString(env, "{\"ok\":true,\"cleared\":true,\"slot\":" + std::to_string(slot) + "}");
+    }
     void* data = nullptr;
     size_t bytes = 0;
     if (napi_get_arraybuffer_info(env, ab, &data, &bytes) != napi_ok || data == nullptr) {
@@ -2491,6 +2525,14 @@ public:
 // 与「静态几何导出」的区别是每帧的粒子位置都来自模拟的真实演化。
 // ---------------------------------------------------------------------------
 struct SimExportState {
+    int id = 0;
+    // 启动瞬间的贴图与天体表快照：保证多个渲染任务互不影响
+    std::vector<uint8_t> texSnap[kMaxTex];
+    int texSnapW[kMaxTex] = { 0 };
+    int texSnapH[kMaxTex] = { 0 };
+    std::vector<BodyTex> bodySnap;
+    std::vector<uint8_t> prevFrame;      // 本任务最近一帧（480x270 RGBA）
+    std::mutex prevMtx;
     std::atomic<bool> active{false};
     std::atomic<bool> abortRequested{false};
     std::atomic<int> rendered{0};
@@ -2505,9 +2547,45 @@ static std::vector<uint8_t> g_prevFrame;
 static const int kPrevW = 480;
 static const int kPrevH = 270;
 
+// 多任务：每个导出任务一份独立状态；工作线程用 thread_local 绑定自己的那份，
+// UI 线程按 taskId 从任务表里取。
+static std::vector<std::shared_ptr<SimExportState>> g_tasks;
+static std::mutex g_taskMtx;
+static int g_nextTaskId = 1;
+static thread_local SimExportState* g_tlsState = nullptr;
+static const size_t kMaxConcurrentExports = 2;   // 并发上限，避免互相拖慢
+
+static std::shared_ptr<SimExportState> findTask(const int id) {
+    std::lock_guard<std::mutex> lk(g_taskMtx);
+    if (id <= 0) {
+        return g_tasks.empty() ? nullptr : g_tasks.back();
+    }
+    for (auto& t : g_tasks) {
+        if (t->id == id) {
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+static size_t activeTaskCount() {
+    std::lock_guard<std::mutex> lk(g_taskMtx);
+    size_t n = 0;
+    for (auto& t : g_tasks) {
+        if (t->active.load()) {
+            ++n;
+        }
+    }
+    return n;
+}
+
 static SimExportState& simExportState() {
-    static SimExportState st;
-    return st;
+    if (g_tlsState != nullptr) {
+        return *g_tlsState;      // 工作线程：自己那份
+    }
+    static SimExportState fallback;
+    const std::shared_ptr<SimExportState> t = findTask(0);
+    return t ? *t : fallback;    // UI 线程：默认最近一个任务
 }
 
 /// 用当前粒子位置渲染一帧并推给编码器
@@ -2529,18 +2607,19 @@ static bool renderSimFrame(const std::vector<float>& pts, const double yaw, cons
     }
     // 顺带生成一张缩小预览（步进采样），供界面在渲染过程中显示
     {
-        std::lock_guard<std::mutex> lock(g_prevMutex);
-        g_prevFrame.resize(size_t(kPrevW) * size_t(kPrevH) * 4);
+        SimExportState& previewState = simExportState();
+        std::lock_guard<std::mutex> lock(previewState.prevMtx);
+        previewState.prevFrame.resize(size_t(kPrevW) * size_t(kPrevH) * 4);
         for (int py = 0; py < kPrevH; ++py) {
             const int sy = py * h / kPrevH;
             for (int px = 0; px < kPrevW; ++px) {
                 const int sx = px * w / kPrevW;
                 const size_t so = (size_t(sy) * size_t(w) + size_t(sx)) * 4;
                 const size_t po = (size_t(py) * size_t(kPrevW) + size_t(px)) * 4;
-                g_prevFrame[po] = rgba[so];
-                g_prevFrame[po + 1] = rgba[so + 1];
-                g_prevFrame[po + 2] = rgba[so + 2];
-                g_prevFrame[po + 3] = 255;
+                previewState.prevFrame[po] = rgba[so];
+                previewState.prevFrame[po + 1] = rgba[so + 1];
+                previewState.prevFrame[po + 2] = rgba[so + 2];
+                previewState.prevFrame[po + 3] = 255;
             }
         }
     }
@@ -2639,9 +2718,8 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
     }
     const std::string optStr(options, len);
 
-    SimExportState& st = simExportState();
-    if (st.active.load()) {
-        return makeString(env, "{\"ok\":false,\"error\":\"已有渲染任务在进行\"}");
+    if (activeTaskCount() >= kMaxConcurrentExports) {
+        return makeString(env, "{\"ok\":false,\"error\":\"已达到并发上限（2 个渲染任务）\"}");
     }
     const auto it = nodeRegistry().find(handle);
     if (it == nodeRegistry().end()) {
@@ -2700,17 +2778,56 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
     }
     const std::string path = readStr("path");
 
+    std::shared_ptr<SimExportState> taskState = std::make_shared<SimExportState>();
     {
-        st.active.store(true);
-        st.abortRequested.store(false);
-        st.rendered.store(0);
-        st.failed.store(false);
-        st.total = total;
-        st.error.clear();
+        std::lock_guard<std::mutex> lk(g_taskMtx);
+        taskState->id = g_nextTaskId++;
+        g_tasks.push_back(taskState);
+        if (g_tasks.size() > 8) {
+            // 清理已完成的老任务，避免无限增长
+            for (auto itr = g_tasks.begin(); itr != g_tasks.end();) {
+                if (*itr != taskState && !(*itr)->active.load()) {
+                    itr = g_tasks.erase(itr);
+                } else {
+                    ++itr;
+                }
+            }
+        }
+    }
+    const int taskId = taskState->id;
+    // 快照当前贴图与天体表（全局写入可能来自 UI 线程，需加锁）
+    {
+
+// 渲染线程的贴图快照（thread_local）：导出任务启动时绑定自己的快照，
+// 这样多个任务并发渲染时互不影响；UI 线程为空则用全局贴图。
+static thread_local const std::vector<uint8_t>* tlsTexSnap[kMaxTex] = { nullptr };
+static thread_local int tlsTexW[kMaxTex] = { 0 };
+static thread_local int tlsTexH[kMaxTex] = { 0 };
+        std::lock_guard<std::mutex> gl(g_texMutex);
+        for (int i = 0; i < kMaxTex; ++i) {
+            taskState->texSnap[i] = g_tex[i];
+            taskState->texSnapW[i] = g_texW[i];
+            taskState->texSnapH[i] = g_texH[i];
+        }
+        taskState->bodySnap = g_bodies;
+    }
+    {
+        taskState->active.store(true);
+        taskState->abortRequested.store(false);
+        taskState->rendered.store(0);
+        taskState->failed.store(false);
+        taskState->total = total;
+        taskState->error.clear();
     }
 
-    std::thread worker([node, width, height, fps, total, bitrate, duration, path]() {
-        SimExportState& st = simExportState();
+    std::thread worker([node, width, height, fps, total, bitrate, duration, path, taskState]() {
+        g_tlsState = taskState.get();      // 绑定本线程的任务状态
+        for (int ti = 0; ti < kMaxTex; ++ti) {
+            tlsTexSnap[ti] = &taskState->texSnap[ti];
+            tlsTexW[ti] = taskState->texSnapW[ti];
+            tlsTexH[ti] = taskState->texSnapH[ti];
+        }
+        SimExportState& st = *taskState;
         VideoWriter writer;
         VideoParams params;
         params.width = width;
@@ -2749,24 +2866,45 @@ napi_value startSimExport(napi_env env, napi_callback_info info) {
             writer.close(closeError);
         }
         st.active.store(false);
+        g_tlsState = nullptr;
     });
     worker.detach();
-    return makeString(env, "{\"ok\":true,\"frames\":" + std::to_string(total) + "}");
+    return makeString(env, "{\"ok\":true,\"taskId\":" + std::to_string(taskId)
+        + ",\"frames\":" + std::to_string(total) + "}");
 }
 
-napi_value stopSimExport(napi_env env, napi_callback_info) {
-    SimExportState& st = simExportState();
+napi_value stopSimExport(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t wantId = 0;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &wantId);
+    }
+    const std::shared_ptr<SimExportState> taskPtr = findTask(wantId);
+    if (!taskPtr) {
+        return makeString(env, "{\"ok\":false,\"error\":\"任务不存在\"}");
+    }
+    SimExportState& st = *taskPtr;
     st.abortRequested.store(true);
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "OpenSPHSimExp",
         "abort requested at frame %{public}d", st.rendered.load());
     return makeString(env, "{\"ok\":true,\"aborting\":true}");
 }
 
-napi_value simExportPreview(napi_env env, napi_callback_info) {
+napi_value simExportPreview(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t wantId = 0;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &wantId);
+    }
     std::vector<uint8_t> copy;
-    {
-        std::lock_guard<std::mutex> lock(g_prevMutex);
-        copy = g_prevFrame;
+    const std::shared_ptr<SimExportState> task = findTask(wantId);
+    if (task) {
+        std::lock_guard<std::mutex> lock(task->prevMtx);
+        copy = task->prevFrame;
     }
     if (copy.empty()) {
         return makeString(env, "{\"ok\":false}");
@@ -2780,8 +2918,17 @@ napi_value simExportPreview(napi_env env, napi_callback_info) {
     return ab;
 }
 
-napi_value simExportStatus(napi_env env, napi_callback_info) {
-    SimExportState& st = simExportState();
+napi_value simExportStatus(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t wantId = 0;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &wantId);
+    }
+    const std::shared_ptr<SimExportState> taskPtr = findTask(wantId);
+    SimExportState fallbackState;
+    SimExportState& st = taskPtr ? *taskPtr : fallbackState;
     std::string json = "{\"active\":" + std::string(st.active.load() ? "true" : "false")
         + ",\"rendered\":" + std::to_string(st.rendered.load())
         + ",\"total\":" + std::to_string(st.total)

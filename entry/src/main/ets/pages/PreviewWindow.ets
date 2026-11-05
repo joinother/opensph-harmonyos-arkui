@@ -24,7 +24,9 @@ struct PreviewWindow {
     this.refresh(true);
     // 模拟运行时定期刷新，静止时只在交互后重绘
     this.timer = setInterval(() => {
-      this.refresh(false);
+      if (!this.refreshFromExport()) {
+        this.refresh(false);
+      }
     }, 500);
   }
 
@@ -32,6 +34,35 @@ struct PreviewWindow {
     if (this.timer >= 0) {
       clearInterval(this.timer);
       this.timer = -1;
+    }
+  }
+
+  // 渲染导出进行中时，优先显示导出线程刚渲染的那一帧（真正的实时状态）
+  private refreshFromExport(): boolean {
+    try {
+      interface SimStatus {
+        active: boolean;
+        rendered: number;
+        total: number;
+      }
+      const st: SimStatus = JSON.parse(String(ark.simExportStatus())) as SimStatus;
+      if (!st.active) {
+        return false;
+      }
+      const ab: ArrayBuffer = ark.simExportPreview() as ArrayBuffer;
+      if (ab === null || ab.byteLength !== 480 * 270 * 4) {
+        return false;
+      }
+      const opts: image.InitializationOptions = {
+        size: { width: 480, height: 270 },
+        pixelFormat: image.PixelMapFormat.RGBA_8888,
+        editable: false
+      };
+      this.pix = image.createPixelMapSync(ab, opts);
+      this.status = `模拟渲染 ${st.rendered} / ${st.total} 帧`;
+      return true;
+    } catch (e) {
+      return false;
     }
   }
 
@@ -92,18 +123,14 @@ struct PreviewWindow {
 
   build() {
     Column() {
+      // 标题与关闭由系统窗口栏提供，这里只留一行状态（不再重复画标题和关闭按钮）
       Row() {
-        Text('OpenSPH 预览').fontSize(13).fontWeight(FontWeight.Medium).fontColor('#0b57d0');
+        Text(this.status).fontSize(11).fontColor('#8b929b');
         Blank();
-        Text(this.status).fontSize(11).fontColor('#8b929b').margin({ right: 10 });
-        Text('关闭').fontSize(11).fontColor('#3c4149')
-          .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-          .borderRadius(6)
-          .backgroundColor('#f0f2f5')
-          .onClick(() => { this.closeSelf(); });
+        Text('拖动旋转 · 滚轮/双指缩放').fontSize(10).fontColor('#b0b6be');
       }
       .width('100%')
-      .padding({ left: 12, right: 12, top: 8, bottom: 8 });
+      .padding({ left: 12, right: 12, top: 6, bottom: 6 });
 
       if (this.pix !== null) {
         Image(this.pix)
