@@ -3960,6 +3960,14 @@ ${circles}
         this.runCurrentSceneSilent();
       }
     } else if (name === '渲染') {
+      if (index === 4) {
+        this.exportMeshFile('obj');
+        return;
+      }
+      if (index === 5) {
+        this.exportMeshFile('ply');
+        return;
+      }
       if (index === 3) {
         // 直接用 C++ 原生预设构建场景（不再经过 ArkTS 拼字符串键）
         this.startSimExportVideo();
@@ -4003,7 +4011,7 @@ ${circles}
         this.simRecording ? '停止录制' : '录制过程', '自检（IC+模拟）', '运行当前场景（自动定位运行节点）', '诊断：静默运行（最小回调）'];
     }
     if (name === '渲染') {
-      return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）'];
+      return ['导出视频…', '录制预览', '以 4K / 3 秒导出', '渲染模拟视频（4K60）', '导出网格 OBJ', '导出网格 PLY'];
     }
     return ['自检', '关于'];
   }
