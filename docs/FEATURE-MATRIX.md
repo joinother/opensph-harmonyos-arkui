@@ -96,3 +96,24 @@
 "看起来对不对"仍需人工用鼠标划过确认。
 
 **已知未覆盖**：`Select` 下拉本体、`Radio/Checkbox`（当前无此控件）、预览子窗口内控件、右键菜单项（依赖同一 `hoverPanel` 逻辑，样式随菜单项生效）。
+
+
+## 脚本作业（ChaiScriptJob）——不移植，与上游默认一致
+
+**依据（源码）**：上游 `CMakeLists.txt` 第 33 行
+
+```cmake
+option(WITH_CHAISCRIPT "Enable scripting tools" OFF)
+```
+
+即 ChaiScript 官方构建默认关闭，`core/run/jobs/ScriptJobs.cpp` 中的
+`ChaiScriptJob` 在默认构建里根本不参与编译。因此：
+
+| 对比项 | 上游默认构建 | 本移植 |
+|---|---|---|
+| ChaiScriptJob | 不存在 | 不存在 ✅ 一致 |
+| 其余 54 个作业 | 全部可用 | 已注册 59 个显示名，可用 ✅ |
+
+**若要启用**需三步：为 OHOS arm64 交叉编译 ChaiScript → 打开 `WITH_CHAISCRIPT`
+→ 重新生成桥接层的作业注册表。工作量约 1–2 天，且需解决异常/RTTI 设置冲突。
+当前判定：**不移植**（不构成能力缺口）。
