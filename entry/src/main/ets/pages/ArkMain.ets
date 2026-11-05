@@ -390,6 +390,7 @@ struct ArkMain {
   @State private stError: string = '';
   @State private stSetUp: number = 0;
   @State private stStage: string = '';
+  @State private meshInfo: string = '网格：未生成';
   @State private stRaw: string = '';
   @State private stTimeSteps: number = 0;
   private lastRunHandle: number = -1;
@@ -2038,7 +2039,9 @@ ${circles}
         text?: string;
         error?: string;
       }
+      this.meshInfo = `网格：请求中 handle=${handle} fmt=${ext}`;
       const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, ext))) as MeshResult;
+      this.meshInfo = `网格：ok=${res.ok} V=${res.vertices ?? 0} F=${res.faces ?? 0} B=${res.bytes ?? 0} 文本长度=${res.text !== undefined ? res.text.length : -1}`;
       if (!res.ok || res.text === undefined) {
         this.noticeService.error('生成网格失败', res.error ?? '');
         return;
@@ -2049,6 +2052,7 @@ ${circles}
       fs.writeSync(f.fd, res.text);
       fs.closeSync(f);
       const st: fs.Stat = fs.statSync(sandbox);
+      this.meshInfo = `网格：沙箱 ${sandbox} = ${st.size} 字节 (F=${res.faces ?? 0})`;
       if (st.size <= 0) {
         this.noticeService.error('网格文件为空', `面数 ${res.faces ?? 0}`);
         return;
@@ -2061,8 +2065,12 @@ ${circles}
         this.noticeService.info('已生成到沙箱', `${res.faces ?? 0} 面 · ${(st.size / 1024).toFixed(1)} KB`);
         return;
       }
-      fs.copyFileSync(sandbox, uris[0]);
+      // copyFileSync 跨沙箱会写成 0 字节（实测），改为直接写文本到目标 URI
+      const f2: fs.File = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+      fs.writeSync(f2.fd, res.text);
+      fs.closeSync(f2);
       const st2: fs.Stat = fs.statSync(uris[0]);
+      this.meshInfo = `网格：沙箱 ${st.size}B → 目标 ${st2.size}B (F=${res.faces ?? 0})`;
       this.noticeService.success('网格已导出',
         `${res.faces ?? 0} 面 · ${(st2.size / 1024).toFixed(1)} KB（.${ext}）`);
     } catch (e) {
@@ -4815,7 +4823,9 @@ ${circles}
         })
         .margin({ right: 10 });
       if (this.canvasTab === 1) {
-        Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 20) : '无'} pal=${this.palOn ? 1 : 0}/${this.palKind} film=${this.filmOn ? 1 : 0} cam=${this.yaw.toFixed(2)}/${this.pitch.toFixed(2)}`)
+        Text(this.meshInfo)
+        .fontSize(9).fontColor('#b06000').margin({ left: 8 });
+      Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 20) : '无'} pal=${this.palOn ? 1 : 0}/${this.palKind} film=${this.filmOn ? 1 : 0} cam=${this.yaw.toFixed(2)}/${this.pitch.toFixed(2)}`)
           .fontSize(9)
           .fontColor('#b06000')
           .margin({ left: 8 });
