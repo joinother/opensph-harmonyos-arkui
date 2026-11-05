@@ -472,6 +472,13 @@ struct ArkMain {
   private exportTimer: number = -1;
 
   @State private yaw: number = 0.7;
+  // 相机预设与滚球惯性（第 6 项）
+  @State private camPreset: number = 0;
+  @State private inertiaOn: boolean = true;
+  private velYaw: number = 0;
+  private velPitch: number = 0;
+  private inertiaTimer: number = -1;
+  private camNames: string[] = ['斜 45°', '正视', '侧视', '俯视', '仰视'];
   @State private pitch: number = 0.45;
   private previewPts: number[] = [];
   private previewBounds: number[] = [0, 0, 0, 0, 0, 0];
@@ -754,6 +761,49 @@ struct ArkMain {
       }
       ctx.fill();
     }
+  }
+
+  // 滚球惯性：拖拽结束时保留角速度，按阻尼衰减继续转动
+  private startInertia(): void {
+    if (!this.inertiaOn) {
+      return;
+    }
+    if (this.inertiaTimer >= 0) {
+      clearInterval(this.inertiaTimer);
+      this.inertiaTimer = -1;
+    }
+    if (Math.abs(this.velYaw) < 0.0004 && Math.abs(this.velPitch) < 0.0004) {
+      return;
+    }
+    this.inertiaTimer = setInterval(() => {
+      this.yaw += this.velYaw;
+      this.pitch = Math.max(-1.5, Math.min(1.5, this.pitch + this.velPitch));
+      this.velYaw *= 0.94;
+      this.velPitch *= 0.94;
+      this.pvTick += 1;
+      this.refreshPixel(this.yaw, this.pitch, false);
+      if (Math.abs(this.velYaw) < 0.0004 && Math.abs(this.velPitch) < 0.0004) {
+        clearInterval(this.inertiaTimer);
+        this.inertiaTimer = -1;
+        this.refreshPixel(this.yaw, this.pitch, true);
+      }
+    }, 16);
+  }
+
+  // 相机预设：平滑过渡到目标视角
+  private applyCamPreset(index: number): void {
+    const targetsYaw: number[] = [0.7, 0.0, 1.5708, 0.0, 0.0];
+    const targetsPitch: number[] = [0.35, 0.0, 0.0, 1.35, -1.35];
+    this.camPreset = index;
+    this.velYaw = 0;
+    this.velPitch = 0;
+    const ty: number = targetsYaw[index];
+    const tp: number = targetsPitch[index];
+    this.getUIContext().animateTo({ duration: durMs(DUR_BASE), curve: Curve.EaseOut }, () => {
+      this.yaw = ty;
+      this.pitch = tp;
+    });
+    setTimeout(() => { this.refreshPixel(this.yaw, this.pitch, true); }, durMs(DUR_BASE) + 30);
   }
 
   private async refreshPixel(yaw: number, pitch: number, force: boolean): Promise<void> {
@@ -4567,7 +4617,7 @@ interface Probe {
         })
         .margin({ right: 10 });
       if (this.canvasTab === 1) {
-        Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 20) : '无'} pal=${this.palOn ? 1 : 0}/${this.palKind} film=${this.filmOn ? 1 : 0}/${this.filmExposure.toFixed(1)}/${this.filmContrast.toFixed(1)}`)
+        Text(`诊断 sel=${this.selectedNode} run=${this.lastRunHandle} pts=${this.previewCount} err=${this.previewError.length > 0 ? this.previewError.substring(0, 20) : '无'} pal=${this.palOn ? 1 : 0}/${this.palKind} film=${this.filmOn ? 1 : 0} cam=${this.yaw.toFixed(2)}/${this.pitch.toFixed(2)}`)
           .fontSize(9)
           .fontColor('#b06000')
           .margin({ left: 8 });
@@ -4595,6 +4645,32 @@ interface Probe {
   @Builder
   previewPane() {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 相机预设 + 惯性（浮动，右上角）
+      Row({ space: 8 }) {
+        Select([{ value: this.camNames[0] }, { value: this.camNames[1] },
+          { value: this.camNames[2] }, { value: this.camNames[3] },
+          { value: this.camNames[4] }])
+          .selected(this.camPreset)
+          .value(`视角：${this.camNames[this.camPreset]}`)
+          .font({ size: 11 })
+          .onSelect((index: number) => { this.applyCamPreset(index); });
+        Row({ space: 4 }) {
+          Text('惯性').fontSize(11).fontColor('#5f6670');
+          Toggle({ type: ToggleType.Switch, isOn: this.inertiaOn })
+            .onChange((v: boolean) => {
+              this.inertiaOn = v;
+              if (!v && this.inertiaTimer >= 0) {
+                clearInterval(this.inertiaTimer);
+                this.inertiaTimer = -1;
+              }
+            });
+        }
+      }
+      .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+      .backgroundColor('#e6ffffff')
+      .borderRadius(10)
+      .position({ x: 12, y: 10 })
+      .zIndex(9);
       // 优先显示 C++ 光栅化结果（含球面纹理）；PixelMap 为空时回退 Canvas
       if (this.previewPix !== null) {
         Image(this.previewPix)
@@ -4620,6 +4696,7 @@ interface Probe {
             .onActionEnd(() => {
               this.previewDragging = false;
               this.pvTick += 1;
+              this.startInertia();
               this.refreshPixel(this.yaw, this.pitch, true);
             })
             .onActionUpdate((event: GestureEvent) => {
@@ -4627,6 +4704,8 @@ interface Probe {
               const dy: number = event.offsetY - this.lastPanY;
               this.lastPanX = event.offsetX;
               this.lastPanY = event.offsetY;
+              this.velYaw = dx * 0.01;      // 末速用于惯性
+              this.velPitch = dy * 0.01;
               this.yaw += dx * 0.01;
               this.pitch = Math.max(-1.5, Math.min(1.5, this.pitch + dy * 0.01));
               this.pvTick += 1;
