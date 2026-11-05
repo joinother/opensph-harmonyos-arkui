@@ -2009,14 +2009,20 @@ ${circles}
   }
 
   // 网格导出：先生成到沙箱（耗时操作不依赖前台），成功后再弹保存面板复制
-  // 诊断用：只生成到沙箱，不弹保存面板（用于验证网格生成能力本身）
-  private meshToSandbox(): void {
+  // 网格导出：内核只产出网格文本，写文件交给 ArkTS（绕开内核写盘崩溃）
+  private async exportMeshFile(ext: string): Promise<void> {
     let handle: number = -1;
-    for (const n of this.nodes) {
-      if (n.handle >= 0 && n.className !== 'SPH run' && n.className !== 'N-body run'
-        && n.className !== 'Position based run') {
-        handle = n.handle;
-        break;
+    const selNode: GraphNode | undefined = this.selectedNode >= 0 ? this.nodeById(this.selectedNode) : undefined;
+    if (selNode !== undefined && selNode.className !== 'SPH run' && selNode.className !== 'N-body run'
+      && selNode.className !== 'Position based run') {
+      handle = selNode.handle;
+    } else {
+      for (const n of this.nodes) {
+        if (n.handle >= 0 && n.className !== 'SPH run' && n.className !== 'N-body run'
+          && n.className !== 'Position based run') {
+          handle = n.handle;
+          break;
+        }
       }
     }
     if (handle < 0) {
@@ -2024,67 +2030,41 @@ ${circles}
       return;
     }
     try {
-      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const path: string = `${ctx.filesDir}/mesh-demo.obj`;
       interface MeshResult {
         ok: boolean;
-        triangles?: number;
+        vertices?: number;
+        faces?: number;
+        bytes?: number;
+        text?: string;
         error?: string;
-        fallback?: boolean;
       }
-      const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, path, 0))) as MeshResult;
-      if (!res.ok) {
-        this.noticeService.error('网格生成失败', res.error ?? '');
-        return;
-      }
-      const st: fs.Stat = fs.statSync(path);
-      this.noticeService.success('网格已生成到沙箱',
-        `${res.triangles ?? 0} 面 · ${(st.size / 1024).toFixed(1)} KB · ${res.fallback ? '包围体' : '等值面'}`);
-    } catch (e) {
-      this.noticeService.error('网格生成异常', String(e));
-    }
-  }
-
-  private async exportMeshFile(ext: string): Promise<void> {
-    const handle: number = this.selectedNode >= 0 ? (this.nodeById(this.selectedNode)?.handle ?? -1) : -1;
-    if (handle < 0) {
-      this.noticeService.warn('无法导出网格', '先选中一个节点');
-      return;
-    }
-    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    const sandbox: string = `${ctx.filesDir}/export.${ext}`;
-    try {
-      // 1) 先做重活：采样 + 等值面/兜底网格 + 写沙箱
-      this.noticeService.info('正在生成网格…', '完成后会弹出保存位置');
-      interface MeshResult {
-        ok: boolean;
-        triangles?: number;
-        error?: string;
-        fallback?: boolean;
-      }
-      const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, sandbox, 0))) as MeshResult;
-      if (!res.ok) {
+      const res: MeshResult = JSON.parse(String(ark.exportMesh(handle, ext))) as MeshResult;
+      if (!res.ok || res.text === undefined) {
         this.noticeService.error('生成网格失败', res.error ?? '');
         return;
       }
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const sandbox: string = `${ctx.filesDir}/mesh-demo.${ext}`;
+      const f: fs.File = fs.openSync(sandbox, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(f.fd, res.text);
+      fs.closeSync(f);
       const st: fs.Stat = fs.statSync(sandbox);
       if (st.size <= 0) {
-        this.noticeService.error('网格为空',
-          `三角面 ${res.triangles ?? 0} 个 · 文件 0 字节`);
+        this.noticeService.error('网格文件为空', `面数 ${res.faces ?? 0}`);
         return;
       }
-      // 2) 再弹保存面板（此时只剩复制，快速完成）
       const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
       opts.newFileNames = [`网格-${Date.now()}.${ext}`];
       const pickerInst: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
       const uris: string[] = await pickerInst.save(opts);
       if (uris.length === 0) {
+        this.noticeService.info('已生成到沙箱', `${res.faces ?? 0} 面 · ${(st.size / 1024).toFixed(1)} KB`);
         return;
       }
       fs.copyFileSync(sandbox, uris[0]);
       const st2: fs.Stat = fs.statSync(uris[0]);
       this.noticeService.success('网格已导出',
-        `${res.triangles ?? 0} 面 · ${(st2.size / 1024).toFixed(1)} KB · ${res.fallback ? '球面包围体' : '等值面'}`);
+        `${res.faces ?? 0} 面 · ${(st2.size / 1024).toFixed(1)} KB（.${ext}）`);
     } catch (e) {
       this.noticeService.error('导出网格失败', String(e));
     }
@@ -3997,7 +3977,7 @@ ${circles}
       }
     } else if (name === '渲染') {
       if (index === 6) {
-        this.meshToSandbox();
+        this.exportMeshFile('obj');
         return;
       }
       if (index === 4) {

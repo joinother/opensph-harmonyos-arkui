@@ -823,99 +823,114 @@ public:
 }  // namespace
 
 napi_value exportMesh(napi_env env, napi_callback_info info) {
-    // 安全开关：网格写出路径在设备上会触发崩溃（疑内核 FileSystem 与 OHOS 的绑定问题），
-    // 先返回明确错误，避免整机应用被拖崩；待原生写文件方案确定后恢复。
-    if (getenv("OPENSPH_MESH_EXPORT") == nullptr) {
-        return makeString(env,
-            "{\"ok\":false,\"error\":\"网格导出暂时停用（内核写盘路径在设备上崩溃），待修复\"}");
-    }
-    size_t argc = 3;
-    napi_value argv[3];
+    size_t argc = 2;
+    napi_value argv[2];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     int32_t handle = -1;
     napi_get_value_int32(env, argv[0], &handle);
-    char pathBuf[1024] = { 0 };
-    size_t pathLen = 0;
-    napi_get_value_string_utf8(env, argv[1], pathBuf, sizeof(pathBuf) - 1, &pathLen);
-    double isoLevel = 0.5;
-    if (argc >= 3) { napi_get_value_double(env, argv[2], &isoLevel); }
-
-    const auto it = nodeRegistry().find(handle);
-    if (it == nodeRegistry().end()) {
-        return makeString(env, "{\"ok\":false,\"error\":\"节点不存在\"}");
+    char fmtBuf[16] = "obj";
+    size_t fmtLen = 0;
+    if (argc >= 2) {
+        napi_get_value_string_utf8(env, argv[1], fmtBuf, sizeof(fmtBuf) - 1, &fmtLen);
     }
+
     std::vector<float> coords;
     std::string sErr;
-    if (!sampleNodePoints(handle, 800, coords, sErr)) {
+    if (!sampleNodePoints(handle, 60, coords, sErr)) {   // 先小样本验证链路，确认后再放开
         return makeString(env, "{\"ok\":false,\"error\":\"" + jsonEscape(String::fromUtf8(sErr.c_str())) + "\"}");
     }
     if (coords.size() < 9) {
         return makeString(env, "{\"ok\":false,\"error\":\"该节点没有足够的粒子\"}");
     }
-    // 求包围盒与平均间距
-    double mn[3] = { 1e300, 1e300, 1e300 }, mx[3] = { -1e300, -1e300, -1e300 };
-    std::vector<Vector> pts;
-    const size_t n = coords.size() / 3;
-    pts.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        const Vector v(coords[i * 3], coords[i * 3 + 1], coords[i * 3 + 2]);
-        pts.push_back(v);
-        for (int k = 0; k < 3; ++k) {
-            mn[k] = std::min(mn[k], double(v[k]));
-            mx[k] = std::max(mx[k], double(v[k]));
-        }
-    }
-    const double sizeX = mx[0] - mn[0], sizeY = mx[1] - mn[1], sizeZ = mx[2] - mn[2];
-    const double ext = std::max(std::max(sizeX, sizeY), sizeZ);
-    if (!(ext > 0) || !std::isfinite(ext)) {
-        return makeString(env, "{\"ok\":false,\"error\":\"点云退化（所有点重合），无法生成网格\"}");
-    }
-    const double cellGuess = ext / 64.0;
-    const double radius = std::max(std::max(ext * 0.06, cellGuess * 1.5), 1e-6);
-    const Vector center(0.5 * (mn[0] + mx[0]), 0.5 * (mn[1] + mx[1]), 0.5 * (mn[2] + mx[2]));
-    const double half = 0.5 * ext + radius;
 
-    // 说明：MarchingCubes 在部分点云上会分配超大网格并导致进程崩溃，
-    // 这里先默认使用「每粒子正二十面体」的确定性几何，保证导出可用。
-    // 等值面路径保留在 USE_MARCHING_CUBES 分支，待资源上限验证后再启用。
-    Array<Triangle> triRef;
-    // 兜底：MarchingCubes 在没有合适等值面时产出 0 面，此时用「每粒子一个正二十面体」
-    // 生成确定非空的网格，保证导出的 obj/ply 可用、可验证。
-    bool usedFallback = true;
-    {
-        const double phi = (1.0 + std::sqrt(5.0)) * 0.5;
-        const Vector ico[12] = {
-            Vector(-1, phi, 0), Vector(1, phi, 0), Vector(-1, -phi, 0), Vector(1, -phi, 0),
-            Vector(0, -1, phi), Vector(0, 1, phi), Vector(0, -1, -phi), Vector(0, 1, -phi),
-            Vector(phi, 0, -1), Vector(phi, 0, 1), Vector(-phi, 0, -1), Vector(-phi, 0, 1)
-        };
-        const int faces[20][3] = {
-            {0,11,5},{0,5,1},{0,1,7},{0,7,10},{0,10,11},
-            {1,5,9},{5,11,4},{11,10,2},{10,7,6},{7,1,8},
-            {3,9,4},{3,4,2},{3,2,6},{3,6,8},{3,8,9},
-            {4,9,5},{2,4,11},{6,2,10},{8,6,7},{9,8,1}
-        };
-        const double pr = std::max(radius * 0.55, 1e-6);
-        for (const Vector& c : pts) {
-            Vector v[12];
-            for (int k = 0; k < 12; ++k) {
-                v[k] = c + ico[k] * (pr / std::sqrt(1.0 + phi * phi));
-            }
+    // 包围盒 → 粒子尺度
+    double mn[3] = { 1e300, 1e300, 1e300 }, mx[3] = { -1e300, -1e300, -1e300 };
+    const size_t n = coords.size() / 3;
+    for (size_t i = 0; i < n; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            mn[k] = std::min(mn[k], double(coords[i * 3 + k]));
+            mx[k] = std::max(mx[k], double(coords[i * 3 + k]));
+        }
+    }
+    const double ext = std::max(std::max(mx[0] - mn[0], mx[1] - mn[1]), mx[2] - mn[2]);
+    if (!(ext > 0) || !std::isfinite(ext)) {
+        return makeString(env, "{\"ok\":false,\"error\":\"点云退化，无法生成网格\"}");
+    }
+    const double pr = ext * 0.012;   // 每粒子球半径
+
+    const double phi = (1.0 + std::sqrt(5.0)) * 0.5;
+    const double ico[12][3] = {
+        { -1, phi, 0 }, { 1, phi, 0 }, { -1, -phi, 0 }, { 1, -phi, 0 },
+        { 0, -1, phi }, { 0, 1, phi }, { 0, -1, -phi }, { 0, 1, -phi },
+        { phi, 0, -1 }, { phi, 0, 1 }, { -phi, 0, -1 }, { -phi, 0, 1 }
+    };
+    const int faces[20][3] = {
+        { 0, 11, 5 }, { 0, 5, 1 }, { 0, 1, 7 }, { 0, 7, 10 }, { 0, 10, 11 },
+        { 1, 5, 9 }, { 5, 11, 4 }, { 11, 10, 2 }, { 10, 7, 6 }, { 7, 1, 8 },
+        { 3, 9, 4 }, { 3, 4, 2 }, { 3, 2, 6 }, { 3, 6, 8 }, { 3, 8, 9 },
+        { 4, 9, 5 }, { 2, 4, 11 }, { 6, 2, 10 }, { 8, 6, 7 }, { 9, 8, 1 }
+    };
+    const double scale = pr / std::sqrt(1.0 + phi * phi);
+
+    // 顶点按粒子逐个写入
+    std::vector<double> verts;
+    verts.reserve(n * 12 * 3);
+    for (size_t i = 0; i < n; ++i) {
+        const double cx = coords[i * 3], cy = coords[i * 3 + 1], cz = coords[i * 3 + 2];
+        for (int k = 0; k < 12; ++k) {
+            verts.push_back(cx + ico[k][0] * scale);
+            verts.push_back(cy + ico[k][1] * scale);
+            verts.push_back(cz + ico[k][2] * scale);
+        }
+    }
+    const size_t faceCnt = n * 20;
+
+    std::string out;
+    std::string fmt(fmtBuf);
+    if (fmt == "ply") {
+        out.reserve(64 + verts.size() * 12 + faceCnt * 36);
+        out += "ply\nformat ascii 1.0\n";
+        out += "element vertex " + std::to_string(verts.size() / 3) + "\n";
+        out += "property float x\nproperty float y\nproperty float z\n";
+        out += "element face " + std::to_string(faceCnt) + "\n";
+        out += "property list uchar int vertex_indices\nend_header\n";
+        char buf[96];
+        for (size_t i = 0; i + 2 < verts.size(); i += 3) {
+            std::snprintf(buf, sizeof(buf), "%.6g %.6g %.6g\n", verts[i], verts[i + 1], verts[i + 2]);
+            out += buf;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const int base = int(i * 12);
             for (int f = 0; f < 20; ++f) {
-                triRef.push(Triangle(v[faces[f][0]], v[faces[f][1]], v[faces[f][2]]));
+                out += "3 " + std::to_string(base + faces[f][0]) + " "
+                    + std::to_string(base + faces[f][1]) + " " + std::to_string(base + faces[f][2]) + "\n";
+            }
+        }
+    } else {
+        out.reserve(64 + verts.size() * 24 + faceCnt * 24);
+        out += "# OpenSPH 导出网格（每粒子一个正二十面体）\n";
+        char buf[128];
+        for (size_t i = 0; i + 2 < verts.size(); i += 3) {
+            std::snprintf(buf, sizeof(buf), "v %.6g %.6g %.6g\n", verts[i], verts[i + 1], verts[i + 2]);
+            out += buf;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const int base = int(i * 12) + 1;   // OBJ 索引从 1 开始
+            for (int f = 0; f < 20; ++f) {
+                out += "f " + std::to_string(base + faces[f][0]) + " "
+                    + std::to_string(base + faces[f][1]) + " " + std::to_string(base + faces[f][2]) + "\n";
             }
         }
     }
-    AutoPtr<IMeshFile> writer = getMeshFile(Path(String::fromUtf8(pathBuf)));
-    if (writer == nullptr) {
-        return makeString(env, "{\"ok\":false,\"error\":\"不支持该网格格式\"}");
-    }
-    const Outcome res = writer->save(Path(String::fromUtf8(pathBuf)), triRef);
-    if (!res) {
-        return makeString(env, "{\"ok\":false,\"error\":\"写入网格失败\"}");
-    }
-    return makeString(env, "{\"ok\":true,\"triangles\":" + std::to_string(triRef.size())
-        + ",\"fallback\":" + (usedFallback ? "true" : "false") + "}");
+
+    std::string json = "{\"ok\":true,\"vertices\":" + std::to_string(verts.size() / 3)
+        + ",\"faces\":" + std::to_string(faceCnt)
+        + ",\"bytes\":" + std::to_string(out.size())
+        + ",\"text\":\"";
+    // 文本直接内联返回（数量已限制在 400 粒子内）
+    json += jsonEscape(String::fromUtf8(out.c_str()));
+    json += "\"}";
+    return makeString(env, json);
 }
 
 napi_value setFilmic(napi_env env, napi_callback_info info) {
